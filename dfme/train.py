@@ -1,21 +1,18 @@
 from __future__ import print_function
-import argparse, ipdb, json
+import pprint,argparse,json,os,random
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.optim as optim
-import network
-from dataloader import get_dataloader
-import os, random
-import numpy as np
 import torchvision
-from pprint import pprint
-from time import time
-
-from approximate_gradients import *
-
 import torchvision.models as models
+
 from my_utils import *
+from dataloader import get_dataloader
+from approximate_gradients import *
+import network
 
 
 print("torch version", torch.__version__)
@@ -263,7 +260,7 @@ def main():
             raise ValueError("Unknown model")
 
 
-    pprint(args, width= 80)
+    pprint.pprint(args, width= 80)
     print(args.log_dir)
     os.makedirs(args.log_dir, exist_ok=True)
 

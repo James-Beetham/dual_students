@@ -1,16 +1,13 @@
+from tqdm import tqdm
+import scipy.linalg
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import scipy.linalg
-import matplotlib.pyplot as plt
-import network
-from tqdm import tqdm
 import torchvision.models as models
-from time import time
 
-# from cifar10_models import *
-
+import network
 
 def estimate_gradient_objective(args, victim_model, clone_model, x, epsilon = 1e-7, m = 5, verb=False, num_classes=10, device = "cpu", pre_x=False):
     # Sampling from unit sphere is the method 3 from this website:

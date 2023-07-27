@@ -1,3 +1,6 @@
+# Tested using python 3.9
+# If using cuda, install torch/torchvision using official pytorch installation 
+# instructions.
 torch>=1.2
 torchvision
 numpy
