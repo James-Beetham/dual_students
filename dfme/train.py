@@ -1,6 +1,6 @@
-from __future__ import print_function
-import pprint,argparse,json,os,random
+import argparse,json,os,random,datetime,logging,math
 
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -9,18 +9,10 @@ import torch.optim as optim
 import torchvision
 import torchvision.models as models
 
-from my_utils import *
+import my_utils
+import approximate_gradients
 from dataloader import get_dataloader
-from approximate_gradients import *
 import network
-
-
-print("torch version", torch.__version__)
-
-def myprint(a):
-    """Log the print statements"""
-    global file
-    print(a); file.write(a); file.write("\n"); file.flush()
 
 
 def student_loss(args, s_logit, t_logit, return_t_logits=False):
@@ -60,8 +52,7 @@ def train(args, teacher, student, generator, device, optimizer, epoch):
     optimizer_S,  optimizer_G = optimizer
 
     gradients = []
-    
-
+    args.train_tqdm.reset()
     for i in range(args.epoch_itrs):
         """Repeat epoch_itrs times per epoch"""
         for _ in range(args.g_iter):
@@ -74,7 +65,7 @@ def train(args, teacher, student, generator, device, optimizer, epoch):
 
 
             ## APPOX GRADIENT
-            approx_grad_wrt_x, loss_G = estimate_gradient_objective(args, teacher, student, fake, 
+            approx_grad_wrt_x, loss_G = approximate_gradients.estimate_gradient_objective(args, teacher, student, fake, 
                                                 epsilon = args.grad_epsilon, m = args.grad_m, num_classes=args.num_classes, 
                                                 device=device, pre_x=True)
 
@@ -83,7 +74,7 @@ def train(args, teacher, student, generator, device, optimizer, epoch):
             optimizer_G.step()
 
             if i == 0 and args.rec_grad_norm:
-                x_true_grad = measure_true_grad_norm(args, fake)
+                x_true_grad = my_utils.measure_true_grad_norm(args, fake)
 
         for _ in range(args.d_iter):
             z = torch.randn((args.batch_size, args.nz)).to(device)
@@ -110,8 +101,10 @@ def train(args, teacher, student, generator, device, optimizer, epoch):
             optimizer_S.step()
 
         # Log Results
+        args.train_tqdm.set_description(args.train_tqdm_desc.format(loss_G.item(),loss_S.item()))
+        args.train_tqdm.update()
         if i % args.log_interval == 0:
-            myprint(f'Train Epoch: {epoch} [{i}/{args.epoch_itrs} ({100*float(i)/float(args.epoch_itrs):.0f}%)]\tG_Loss: {loss_G.item():.6f} S_loss: {loss_S.item():.6f}')
+            # args.logger.info(f'Train Epoch: {epoch} [{i}/{args.epoch_itrs} ({100*float(i)/float(args.epoch_itrs):.0f}%)]\tG_Loss: {loss_G.item():.6f} S_loss: {loss_S.item():.6f}')
             
             if i == 0:
                 with open(args.log_dir + "/loss.csv", "a") as f:
@@ -140,6 +133,8 @@ def test(args, student = None, generator = None, device = "cuda", test_loader = 
 
     test_loss = 0
     correct = 0
+    total = 0
+    args.test_tqdm.reset()
     with torch.no_grad():
         for i, (data, target) in enumerate(test_loader):
             data, target = data.to(device), target.to(device)
@@ -148,12 +143,15 @@ def test(args, student = None, generator = None, device = "cuda", test_loader = 
             test_loss += F.cross_entropy(output, target, reduction='sum').item() # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
+            total += data.size(0)
+            args.test_tqdm.set_description(args.test_tqdm_desc.format(test_loss/total,correct/total*100))
+            args.test_tqdm.update()
 
     test_loss /= len(test_loader.dataset)
     accuracy = 100. * correct / len(test_loader.dataset)
-    myprint('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.4f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        accuracy))
+    # args.logger.info('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.4f}%)\n'.format(
+    #     test_loss, correct, len(test_loader.dataset),
+    #     accuracy))
     with open(args.log_dir + "/accuracy.csv", "a") as f:
         f.write("%d,%f\n"%(epoch, accuracy))
     acc = correct/len(test_loader.dataset)
@@ -178,7 +176,7 @@ def main():
     parser = argparse.ArgumentParser(description='DFAD CIFAR')
     parser.add_argument('--batch_size', type=int, default=256, metavar='N',help='input batch size for training (default: 256)')
     parser.add_argument('--query_budget', type=float, default=20, metavar='N', help='Query budget for the extraction attack in millions (default: 20M)')
-    parser.add_argument('--epoch_itrs', type=int, default=50)  
+    parser.add_argument('--epoch_itrs', type=int, default=50)
     parser.add_argument('--g_iter', type=int, default=1, help = "Number of generator iterations per epoch_iter")
     parser.add_argument('--d_iter', type=int, default=5, help = "Number of discriminator iterations per epoch_iter")
 
@@ -194,13 +192,12 @@ def main():
     parser.add_argument('--scale', type=float, default=3e-1, help = "Fractional decrease in lr")
 
     parser.add_argument('--dataset', type=str, default='cifar10', choices=['svhn','cifar10'], help='dataset name (default: cifar10)')
-    parser.add_argument('--data_root', type=str, default='data')
-    parser.add_argument('--model', type=str, default='resnet34_8x', choices=classifiers, help='Target model name (default: resnet34_8x)')
+    parser.add_argument('--data_dir', type=str, default='data')
+    parser.add_argument('--model', type=str, default='resnet34_8x', choices=my_utils.classifiers, help='Target model name (default: resnet34_8x)')
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
-    parser.add_argument('--no-cuda', action='store_true', default=False,
-                        help='disables CUDA training')
+    parser.add_argument('--cuda', type=int, default=0, help='Cuda device to use, or -1 to use cpu.')
     parser.add_argument('--seed', type=int, default=random.randint(0, 100000), metavar='S',
                         help='random seed (default: 1)')
     parser.add_argument('--ckpt', type=str, default='checkpoint/teacher/cifar10-resnet34_8x.pt')
@@ -209,8 +206,12 @@ def main():
     parser.add_argument('--student_load_path', type=str, default=None)
     parser.add_argument('--model_id', type=str, default="debug")
 
-    parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--log_dir', type=str, default="results")
+    parser.add_argument('--log_dir', type=str, default='results')
+    parser.add_argument('--log_level', type=str, choices=logging._nameToLevel, default='INFO')
+    parser.add_argument('--disable_tqdm', default=False, action='store_true', help='Disables tqdm output.')
+    parser.add_argument('--save_config', type=int, default=1, help='Whether to save the config file.')
+    parser.add_argument('--config', nargs='+',default=[], help='One or more config files to load arguments from.'+
+                        'Note, config values overwrite all values in the order of config files specified.')
 
     # Gradient approximation parameters
     parser.add_argument('--approx_grad', type=int, default=1, help = 'Always set to 1')
@@ -236,15 +237,17 @@ def main():
 
 
     args = parser.parse_args()
+    my_utils.setup_args(args)
 
+    args.logger.info(f'torch version: {torch.__version__}')
 
     args.query_budget *=  10**6
     args.query_budget = int(args.query_budget)
     if args.MAZE:
 
-        print("\n"*2)
-        print("#### /!\ OVERWRITING ALL PARAMETERS FOR MAZE REPLCIATION ####")
-        print("\n"*2)
+        args.logger.info("\n"*2)
+        args.logger.info("#### /!\ OVERWRITING ALL PARAMETERS FOR MAZE REPLCIATION ####")
+        args.logger.info("\n"*2)
         args.scheduer = "cosine"
         args.loss = "kl"
         args.batch_size = 128
@@ -255,22 +258,13 @@ def main():
         args.lr_S = 1e-1
 
 
-    if args.student_model not in classifiers:
+    if args.student_model not in my_utils.classifiers:
         if "wrn" not in args.student_model:
             raise ValueError("Unknown model")
 
-
-    pprint.pprint(args, width= 80)
-    print(args.log_dir)
-    os.makedirs(args.log_dir, exist_ok=True)
-
+    args.logger.info(args.log_dir)
     if args.store_checkpoints:
         os.makedirs(args.log_dir + "/checkpoint", exist_ok=True)
-
-    
-    # Save JSON with parameters
-    with open(args.log_dir + "/parameters.json", "w") as f:
-        json.dump(vars(args), f)
 
     with open(args.log_dir + "/loss.csv", "w") as f:
         f.write("epoch,loss_G,loss_S\n")
@@ -282,9 +276,10 @@ def main():
         with open(args.log_dir + "/norm_grad.csv", "w") as f:
             f.write("epoch,G_grad_norm,S_grad_norm,grad_wrt_X\n")
 
-    with open("latest_experiments.txt", "a") as f:
-        f.write(args.log_dir + "\n")
-    use_cuda = not args.no_cuda and torch.cuda.is_available()
+    with open('latest_experiments.txt', 'a') as f: f.write(f'{datetime.datetime.now().strftime("%Y/%m/%d, %H:%M:%S")}\t{args.log_dir}\n')
+
+    use_cuda = not args.cuda < 0 and torch.cuda.is_available()
+    args.device = torch.device(f'cuda:{args.cuda}' if use_cuda else 'cpu')
 
     # Prepare the environment
     torch.manual_seed(args.seed)
@@ -294,7 +289,6 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    device = torch.device("cuda:%d"%args.device if use_cuda else "cpu")
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
     
     # Preparing checkpoints for the best Student
@@ -302,13 +296,9 @@ def main():
     model_dir = f"checkpoint/student_{args.model_id}"; args.model_dir = model_dir
     if(not os.path.exists(model_dir)):
         os.makedirs(model_dir)
-    with open(f"{model_dir}/model_info.txt", "w") as f:
-        json.dump(args.__dict__, f, indent=2)  
+    # with open(f"{model_dir}/model_info.txt", "w") as f:
+    #     json.dump(args.__dict__, f, indent=2)  
     file = open(f"{args.model_dir}/logs.txt", "w") 
-
-    print(args)
-
-    args.device = device
 
     # Eigen values and vectors of the covariance matrix
     _, test_loader = get_dataloader(args)
@@ -323,58 +313,52 @@ def main():
     if args.model == 'resnet34_8x':
         teacher = network.resnet_8x.ResNet34_8x(num_classes=num_classes)
         if args.dataset == 'svhn':
-            print("Loading SVHN TEACHER")
+            args.logger.info("Loading SVHN TEACHER")
             args.ckpt = 'checkpoint/teacher/svhn-resnet34_8x.pt'
-        teacher.load_state_dict( torch.load( args.ckpt, map_location=device) )
+        teacher.load_state_dict( torch.load( args.ckpt, map_location=args.device) )
     else:
-        teacher = get_classifier(args.model, pretrained=True, num_classes=args.num_classes)
+        teacher = my_utils.get_classifier(args.model, pretrained=True, num_classes=args.num_classes)
     
     
 
     teacher.eval()
-    teacher = teacher.to(device)
-    myprint("Teacher restored from %s"%(args.ckpt)) 
-    print(f"\n\t\tTraining with {args.model} as a Target\n") 
+    teacher = teacher.to(args.device)
+    args.logger.info(f'Teacher restored from: {args.ckpt}') 
+    args.logger.info(f'Training with {args.model} as a Target') 
     correct = 0
     with torch.no_grad():
-        for i, (data, target) in enumerate(test_loader):
-            data, target = data.to(device), target.to(device)
+        for i, (data, target) in tqdm(enumerate(test_loader),disable=args.disable_tqdm):
+            data, target = data.to(args.device), target.to(args.device)
             output = teacher(data)
             pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
     accuracy = 100. * correct / len(test_loader.dataset)
-    print('\nTeacher - Test set: Accuracy: {}/{} ({:.4f}%)\n'.format(correct, len(test_loader.dataset),accuracy))
-    
-    
-    
-    student = get_classifier(args.student_model, pretrained=False, num_classes=args.num_classes)
-    
+    args.logger.info(f'Teacher - Test set: Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.4f}%)')
+        
+    student = my_utils.get_classifier(args.student_model, pretrained=False, num_classes=args.num_classes)
     generator = network.gan.GeneratorA(nz=args.nz, nc=3, img_size=32, activation=args.G_activation)
 
-
-    
-    student = student.to(device)
-    generator = generator.to(device)
+    student = student.to(args.device)
+    generator = generator.to(args.device)
 
     args.generator = generator
     args.student = student
     args.teacher = teacher
 
-    
     if args.student_load_path :
         # "checkpoint/student_no-grad/cifar10-resnet34_8x.pt"
         student.load_state_dict( torch.load( args.student_load_path ) )
-        myprint("Student initialized from %s"%(args.student_load_path))
-        acc = test(args, student=student, generator=generator, device = device, test_loader = test_loader)
+        args.logger.info(f'Student initialized from {args.student_load_path}')
+        acc = test(args, student=student, generator=generator, device = args.device, test_loader = test_loader)
 
     ## Compute the number of epochs with the given query budget:
     args.cost_per_iteration = args.batch_size * (args.g_iter * (args.grad_m+1) + args.d_iter)
 
     number_epochs = args.query_budget // (args.cost_per_iteration * args.epoch_itrs) + 1
 
-    print (f"\nTotal budget: {args.query_budget//1000}k")
-    print ("Cost per iterations: ", args.cost_per_iteration)
-    print ("Total number of epochs: ", number_epochs)
+    args.logger.info(f'Total budget: {args.query_budget//1000}k')
+    args.logger.info(f'Cost per iterations: {args.cost_per_iteration}')
+    args.logger.info(f'Total number of epochs: {number_epochs}')
 
     optimizer_S = optim.SGD( student.parameters(), lr=args.lr_S, weight_decay=args.weight_decay, momentum=0.9 )
 
@@ -384,8 +368,7 @@ def main():
         optimizer_G = optim.Adam( generator.parameters(), lr=args.lr_G )
     
     steps = sorted([int(step * number_epochs) for step in args.steps])
-    print("Learning rate scheduling at steps: ", steps)
-    print()
+    args.logger.info(f'Learning rate scheduling at steps: {steps}')
 
     if args.scheduler == "multistep":
         scheduler_S = optim.lr_scheduler.MultiStepLR(optimizer_S, steps, args.scale)
@@ -393,43 +376,42 @@ def main():
     elif args.scheduler == "cosine":
         scheduler_S = optim.lr_scheduler.CosineAnnealingLR(optimizer_S, number_epochs)
         scheduler_G = optim.lr_scheduler.CosineAnnealingLR(optimizer_G, number_epochs)
-
+    schedulers = [scheduler_S,scheduler_G]
 
     best_acc = 0
     acc_list = []
 
-    for epoch in range(1, number_epochs + 1):
+    epoch_desc = 'Epochs: [test_acc {:.02f}% ({:.02f}% best)]'
+    epoch_tqdm = tqdm(range(1,number_epochs + 1), desc=epoch_desc.format(0,0), disable=args.disable_tqdm, position=0)
+    args.train_tqdm_desc = 'Train: [loss G={:.04f}|S={:.04f}]'
+    args.train_tqdm = tqdm(total=args.epoch_itrs, desc=args.train_tqdm_desc.format(0,0), disable=args.disable_tqdm, position=1)    
+    args.test_tqdm_desc = 'Test: [loss S={:.04f}][acc {:.02f}]'
+    args.test_tqdm = tqdm(total=math.ceil(len(test_loader.dataset)/args.batch_size), desc=args.test_tqdm_desc.format(0,0), disable=args.disable_tqdm, position=2)
+    for epoch in epoch_tqdm:
         # Train
-        if args.scheduler != "none":
-            scheduler_S.step()
-            scheduler_G.step()
-        
-
-        train(args, teacher=teacher, student=student, generator=generator, device=device, optimizer=[optimizer_S, optimizer_G], epoch=epoch)
+        train(args, teacher=teacher, student=student, generator=generator, device=args.device, optimizer=[optimizer_S, optimizer_G], epoch=epoch)
+        if args.scheduler != "none": [v.step() for v in schedulers]
         # Test
-        acc = test(args, student=student, generator=generator, device = device, test_loader = test_loader, epoch=epoch)
+        acc = test(args, student=student, generator=generator, device = args.device, test_loader = test_loader, epoch=epoch)
+        epoch_tqdm.set_description(epoch_desc.format(acc*100,best_acc*100))
         acc_list.append(acc)
         if acc>best_acc:
             best_acc = acc
             name = 'resnet34_8x'
             torch.save(student.state_dict(),f"checkpoint/student_{args.model_id}/{args.dataset}-{name}.pt")
             torch.save(generator.state_dict(),f"checkpoint/student_{args.model_id}/{args.dataset}-{name}-generator.pt")
-        # vp.add_scalar('Acc', epoch, acc)
         if args.store_checkpoints:
             torch.save(student.state_dict(), args.log_dir + f"/checkpoint/student.pt")
             torch.save(generator.state_dict(), args.log_dir + f"/checkpoint/generator.pt")
-    myprint("Best Acc=%.6f"%best_acc)
+    args.logger.info("Best Acc=%.6f"%best_acc)
 
-    with open(args.log_dir + "/Max_accuracy = %f"%best_acc, "w") as f:
-        f.write(" ")
+    with open(args.log_dir + "/Max_accuracy = %f"%best_acc, "w") as f: f.write(" ")
 
-     
-
-    import csv
-    os.makedirs('log', exist_ok=True)
-    with open('log/DFAD-%s.csv'%(args.dataset), 'a') as f:
-        writer = csv.writer(f)
-        writer.writerow(acc_list)
+    # import csv
+    # os.makedirs('log', exist_ok=True)
+    # with open('log/DFAD-%s.csv'%(args.dataset), 'a') as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(acc_list)
 
 
 if __name__ == '__main__':
