@@ -1,8 +1,9 @@
-import logging,os,argparse,string,shutil,json,sys
+import logging,os,argparse,string,shutil,json,sys,typing
 
 from cifar10_models import *
 from approximate_gradients import *
 import network
+import train
 
 def setup_args(args:argparse.Namespace, logger_name='default'):
     """Checks and sets up common default arguments.
@@ -202,14 +203,14 @@ def get_classifier(classifier, pretrained=True, num_classes=10):
         raise NameError('Please enter a valid classifier')
 
 
-def measure_true_grad_norm(args, x):
+def measure_true_grad_norm(opts:train.TrainOpts, x:torch.Tensor):
     # Compute true gradient of loss wrt x
-    true_grad, _ = compute_gradient(args, args.teacher, args.student, x, pre_x=True, device=args.device)
+    true_grad, _ = compute_gradient(opts.args, opts.teacher, opts.student, x, pre_x=True, device=opts.device)
+    if true_grad == None: return None
     true_grad = true_grad.view(-1, 3072)
 
     # Compute norm of gradients
-    norm_grad = true_grad.norm(2, dim=1).mean().cpu()
-
+    norm_grad:torch.Tensor = true_grad.norm(2, dim=1).mean().cpu()
     return norm_grad
 
 classifiers = [

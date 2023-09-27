@@ -3,3 +3,7 @@
 dfme/save_results/*
 dfme/checkpoint/*
 dfme/data/*
+dfme/log/
+dfme/latest_experiments.txt
+
+.vscode/

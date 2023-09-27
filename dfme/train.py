@@ -1,4 +1,4 @@
-import argparse,json,os,random,datetime,logging,math
+import argparse,json,os,random,datetime,logging,math,dataclasses
 
 from tqdm import tqdm
 import numpy as np
@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.models as models
+import torch.utils.data as torch_utils_data
 
 import my_utils
 import approximate_gradients
@@ -42,47 +43,56 @@ def generator_loss(args, s_logit, t_logit,  z = None, z_logit = None, reduction=
             
     return loss
 
-
-def train(args, teacher, student, generator, device, optimizer, epoch):
+@dataclasses.dataclass(frozen=True,order=True)
+class TrainTestOpts():
+    student: torch.nn.Module
+    generator: torch.nn.Module
+    device: torch.device
+    use_tqdm: tqdm
+    use_tqdm_desc: str
+@dataclasses.dataclass(frozen=True,order=True)
+class TrainOpts(TrainTestOpts):
+    teacher: torch.nn.Module
+    student_optimizer: optim.Optimizer
+    generator_optimizer: optim.Optimizer
+    args: argparse.Namespace
+def train(opts:TrainOpts):
     """Main Loop for one epoch of Training Generator and Student"""
+    args = opts.args
     global file
-    teacher.eval()
-    student.train()
+    opts.teacher.eval()
+    opts.student.train()
     
-    optimizer_S,  optimizer_G = optimizer
-
     gradients = []
-    args.train_tqdm.reset()
+    opts.use_tqdm.reset()
     for i in range(args.epoch_itrs):
         """Repeat epoch_itrs times per epoch"""
         for _ in range(args.g_iter):
             #Sample Random Noise
-            z = torch.randn((args.batch_size, args.nz)).to(device)
-            optimizer_G.zero_grad()
-            generator.train()
+            z = torch.randn((args.batch_size, args.nz)).to(opts.device)
+            opts.generator_optimizer.zero_grad()
+            opts.generator.train()
             #Get fake image from generator
-            fake = generator(z, pre_x=args.approx_grad) # pre_x returns the output of G before applying the activation
+            fake:torch.Tensor = opts.generator(z, pre_x=args.approx_grad) # pre_x returns the output of G before applying the activation
 
 
             ## APPOX GRADIENT
-            approx_grad_wrt_x, loss_G = approximate_gradients.estimate_gradient_objective(args, teacher, student, fake, 
+            approx_grad_wrt_x, loss_G = approximate_gradients.estimate_gradient_objective(args, opts.teacher, opts.student, fake, 
                                                 epsilon = args.grad_epsilon, m = args.grad_m, num_classes=args.num_classes, 
-                                                device=device, pre_x=True)
+                                                device=opts.device, pre_x=True)
 
             fake.backward(approx_grad_wrt_x)
-                
-            optimizer_G.step()
+            opts.generator_optimizer.step()
 
             if i == 0 and args.rec_grad_norm:
-                x_true_grad = my_utils.measure_true_grad_norm(args, fake)
+                x_true_grad = my_utils.measure_true_grad_norm(opts, fake)
 
         for _ in range(args.d_iter):
-            z = torch.randn((args.batch_size, args.nz)).to(device)
-            fake = generator(z).detach()
-            optimizer_S.zero_grad()
+            z = torch.randn((args.batch_size, args.nz)).to(opts.device)
+            fake = opts.generator(z).detach()
+            opts.student_optimizer.zero_grad()
 
-            with torch.no_grad(): 
-                t_logit = teacher(fake)
+            with torch.no_grad(): t_logit = opts.teacher(fake)
 
             # Correction for the fake logits
             if args.loss == "l1" and args.no_logits:
@@ -92,70 +102,70 @@ def train(args, teacher, student, generator, device, optimizer, epoch):
                 elif args.logit_correction == 'mean':
                     t_logit -= t_logit.mean(dim=1).view(-1, 1).detach()
 
-
-            s_logit = student(fake)
-
+            s_logit = opts.student(fake)
 
             loss_S = student_loss(args, s_logit, t_logit)
             loss_S.backward()
-            optimizer_S.step()
+            opts.student_optimizer.step()
 
         # Log Results
-        args.train_tqdm.set_description(args.train_tqdm_desc.format(loss_G.item(),loss_S.item()))
-        args.train_tqdm.update()
+        opts.use_tqdm.set_description(opts.use_tqdm_desc.format(loss_G.item(),loss_S.item()))
+        opts.use_tqdm.update()
         if i % args.log_interval == 0:
             # args.logger.info(f'Train Epoch: {epoch} [{i}/{args.epoch_itrs} ({100*float(i)/float(args.epoch_itrs):.0f}%)]\tG_Loss: {loss_G.item():.6f} S_loss: {loss_S.item():.6f}')
             
             if i == 0:
-                with open(args.log_dir + "/loss.csv", "a") as f:
-                    f.write("%d,%f,%f\n"%(epoch, loss_G, loss_S))
-
-
+                with open(args.log_dir + "/loss.json.txt", "a") as f:
+                    f.write(json.dumps(dict(epoch=args.epoch,
+                                            generator_loss=loss_G.item(),
+                                            student_loss=loss_S.item()))+'\n')
             if args.rec_grad_norm and i == 0:
-
-                G_grad_norm, S_grad_norm = compute_grad_norms(generator, student)
+                G_grad_norm, S_grad_norm = compute_grad_norms(opts.generator, opts.student)
                 if i == 0:
-                    with open(args.log_dir + "/norm_grad.csv", "a") as f:
-                        f.write("%d,%f,%f,%f\n"%(epoch, G_grad_norm, S_grad_norm, x_true_grad))
-                    
+                    with open(args.log_dir + "/norm_grad.json.txt", "a") as f:
+                        f.write(json.dumps(dict(epoch=args.epoch,
+                                                generator_grad=G_grad_norm.item(),
+                                                student_grad=S_grad_norm.item(),
+                                                true_grad=None if x_true_grad == None else x_true_grad.item()))+'\n')
 
         # update query budget
         args.query_budget -= args.cost_per_iteration
-
         if args.query_budget < args.cost_per_iteration:
-            return 
+            break
+    return dict() 
 
-
-def test(args, student = None, generator = None, device = "cuda", test_loader = None, epoch=0):
+@dataclasses.dataclass(frozen=True,order=True)
+class TestOpts(TrainTestOpts):
+    loader: torch_utils_data.DataLoader
+def test(opts:TestOpts):
     global file
-    student.eval()
-    generator.eval()
+    opts.student.eval()
+    opts.generator.eval()
 
-    test_loss = 0
+    loss_sum = 0
     correct = 0
     total = 0
-    args.test_tqdm.reset()
+    opts.use_tqdm.reset()
     with torch.no_grad():
-        for i, (data, target) in enumerate(test_loader):
-            data, target = data.to(device), target.to(device)
-            output = student(data)
+        for i, (data, target) in enumerate(opts.loader):
+            data: torch.Tensor; target: torch.Tensor
+            data, target = data.to(opts.device), target.to(opts.device)
+            output:torch.Tensor = opts.student(data)
 
-            test_loss += F.cross_entropy(output, target, reduction='sum').item() # sum up batch loss
+            loss_sum += F.cross_entropy(output, target, reduction='sum').item() # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
             total += data.size(0)
-            args.test_tqdm.set_description(args.test_tqdm_desc.format(test_loss/total,correct/total*100))
-            args.test_tqdm.update()
+            opts.use_tqdm.set_description(opts.use_tqdm_desc.format(loss_sum/total,correct/total*100))
+            opts.use_tqdm.update()
 
-    test_loss /= len(test_loader.dataset)
-    accuracy = 100. * correct / len(test_loader.dataset)
-    # args.logger.info('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.4f}%)\n'.format(
-    #     test_loss, correct, len(test_loader.dataset),
-    #     accuracy))
-    with open(args.log_dir + "/accuracy.csv", "a") as f:
-        f.write("%d,%f\n"%(epoch, accuracy))
-    acc = correct/len(test_loader.dataset)
-    return acc
+    loss_sum /= len(opts.loader.dataset)
+    accuracy = correct / len(opts.loader.dataset)
+    ret_log = dict(
+        loss=loss_sum,
+        accuracy=accuracy
+    )
+    return accuracy, ret_log
 
 def compute_grad_norms(generator, student):
     G_grad = []
@@ -266,16 +276,6 @@ def main():
     if args.store_checkpoints:
         os.makedirs(args.log_dir + "/checkpoint", exist_ok=True)
 
-    with open(args.log_dir + "/loss.csv", "w") as f:
-        f.write("epoch,loss_G,loss_S\n")
-
-    with open(args.log_dir + "/accuracy.csv", "w") as f:
-        f.write("epoch,accuracy\n")
-
-    if args.rec_grad_norm:
-        with open(args.log_dir + "/norm_grad.csv", "w") as f:
-            f.write("epoch,G_grad_norm,S_grad_norm,grad_wrt_X\n")
-
     with open('latest_experiments.txt', 'a') as f: f.write(f'{datetime.datetime.now().strftime("%Y/%m/%d, %H:%M:%S")}\t{args.log_dir}\n')
 
     use_cuda = not args.cuda < 0 and torch.cuda.is_available()
@@ -341,10 +341,6 @@ def main():
     student = student.to(args.device)
     generator = generator.to(args.device)
 
-    args.generator = generator
-    args.student = student
-    args.teacher = teacher
-
     if args.student_load_path :
         # "checkpoint/student_no-grad/cifar10-resnet34_8x.pt"
         student.load_state_dict( torch.load( args.student_load_path ) )
@@ -383,17 +379,33 @@ def main():
 
     epoch_desc = 'Epochs: [test_acc {:.02f}% ({:.02f}% best)]'
     epoch_tqdm = tqdm(range(1,number_epochs + 1), desc=epoch_desc.format(0,0), disable=args.disable_tqdm, position=0)
-    args.train_tqdm_desc = 'Train: [loss G={:.04f}|S={:.04f}]'
-    args.train_tqdm = tqdm(total=args.epoch_itrs, desc=args.train_tqdm_desc.format(0,0), disable=args.disable_tqdm, position=1)    
-    args.test_tqdm_desc = 'Test: [loss S={:.04f}][acc {:.02f}]'
-    args.test_tqdm = tqdm(total=math.ceil(len(test_loader.dataset)/args.batch_size), desc=args.test_tqdm_desc.format(0,0), disable=args.disable_tqdm, position=2)
+    train_tqdm_desc = 'Train: [loss G={:.04f}|S={:.04f}]'
+    test_tqdm_desc = 'Test: [loss S={:.04f}][acc {:.02f}]'
+    trainOpts = TrainOpts(
+        student=student,teacher=teacher,generator=generator,
+        student_optimizer=optimizer_S,generator_optimizer=optimizer_G,
+        device=args.device,args=args,
+        use_tqdm=tqdm(total=args.epoch_itrs, desc=train_tqdm_desc.format(0,0), 
+                      disable=args.disable_tqdm, position=1),
+        use_tqdm_desc=train_tqdm_desc)
+    testOpts = TestOpts(
+        student=student,generator=generator,
+        device=args.device,
+        loader=test_loader,
+        use_tqdm=tqdm(total=math.ceil(len(test_loader.dataset)/args.batch_size), 
+                      desc=test_tqdm_desc.format(0,0), 
+                      disable=args.disable_tqdm, position=2),
+        use_tqdm_desc=test_tqdm_desc)
     for epoch in epoch_tqdm:
         # Train
-        train(args, teacher=teacher, student=student, generator=generator, device=args.device, optimizer=[optimizer_S, optimizer_G], epoch=epoch)
+        args.epoch = epoch
+        train_logs = train(trainOpts)
         if args.scheduler != "none": [v.step() for v in schedulers]
         # Test
-        acc = test(args, student=student, generator=generator, device = args.device, test_loader = test_loader, epoch=epoch)
+        acc,test_logs = test(testOpts)
         epoch_tqdm.set_description(epoch_desc.format(acc*100,best_acc*100))
+        with open(os.path.join(args.log_dir,'logs.json.txt'),'a') as f:
+            f.write(json.dumps({**dict(epoch=epoch),**train_logs,**test_logs})+'\n')
         acc_list.append(acc)
         if acc>best_acc:
             best_acc = acc

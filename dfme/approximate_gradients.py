@@ -105,7 +105,7 @@ def estimate_gradient_objective(args, victim_model, clone_model, x, epsilon = 1e
         return gradient_estimates.detach(), loss_G
 
 
-def compute_gradient(args, victim_model, clone_model, x, pre_x=False, device="cpu"):
+def compute_gradient(args, victim_model, clone_model, x:torch.Tensor, pre_x=False, device="cpu"):
     if pre_x and args.G_activation is None:
         raise ValueError(args.G_activation)
 
