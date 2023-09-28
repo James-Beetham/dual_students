@@ -16,43 +16,18 @@ from dataloader import get_dataloader
 import network
 
 
-def student_loss(args, s_logit, t_logit, return_t_logits=False):
-    """Kl/ L1 Loss for student"""
-    print_logits =  False
-    if args.loss == "l1":
-        loss_fn = F.l1_loss
-        loss = loss_fn(s_logit, t_logit.detach())
-    elif args.loss == "kl":
-        loss_fn = F.kl_div
-        s_logit = F.log_softmax(s_logit, dim=1)
-        t_logit = F.softmax(t_logit, dim=1)
-        loss = loss_fn(s_logit, t_logit.detach(), reduction="batchmean")
-    else:
-        raise ValueError(args.loss)
-
-    if return_t_logits:
-        return loss, t_logit.detach()
-    else:
-        return loss
-
-def generator_loss(args, s_logit, t_logit,  z = None, z_logit = None, reduction="mean"):
-    assert 0 
-    
-    loss = - F.l1_loss( s_logit, t_logit , reduction=reduction) 
-    
-            
-    return loss
-
 @dataclasses.dataclass(frozen=True,order=True)
 class TrainTestOpts():
     student: torch.nn.Module
     generator: torch.nn.Module
+    student_loss: torch.nn.Module
     device: torch.device
     use_tqdm: tqdm
     use_tqdm_desc: str
 @dataclasses.dataclass(frozen=True,order=True)
 class TrainOpts(TrainTestOpts):
     teacher: torch.nn.Module
+    generator_loss: torch.nn.Module
     student_optimizer: optim.Optimizer
     generator_optimizer: optim.Optimizer
     args: argparse.Namespace
@@ -63,7 +38,6 @@ def train(opts:TrainOpts):
     opts.teacher.eval()
     opts.student.train()
     
-    gradients = []
     opts.use_tqdm.reset()
     for i in range(args.epoch_itrs):
         """Repeat epoch_itrs times per epoch"""
@@ -93,18 +67,9 @@ def train(opts:TrainOpts):
             opts.student_optimizer.zero_grad()
 
             with torch.no_grad(): t_logit = opts.teacher(fake)
-
-            # Correction for the fake logits
-            if args.loss == "l1" and args.no_logits:
-                t_logit = F.log_softmax(t_logit, dim=1).detach()
-                if args.logit_correction == 'min':
-                    t_logit -= t_logit.min(dim=1).values.view(-1, 1).detach()
-                elif args.logit_correction == 'mean':
-                    t_logit -= t_logit.mean(dim=1).view(-1, 1).detach()
-
             s_logit = opts.student(fake)
 
-            loss_S = student_loss(args, s_logit, t_logit)
+            loss_S = opts.student_loss(s_logit,t_logit.detach())
             loss_S.backward()
             opts.student_optimizer.step()
 
@@ -140,7 +105,6 @@ class TestOpts(TrainTestOpts):
 def test(opts:TestOpts):
     global file
     opts.student.eval()
-    opts.generator.eval()
 
     loss_sum = 0
     correct = 0
@@ -303,53 +267,41 @@ def main():
     # Eigen values and vectors of the covariance matrix
     _, test_loader = get_dataloader(args)
 
-
     args.normalization_coefs = None
     args.G_activation = torch.tanh
 
-    num_classes = 10 if args.dataset in ['cifar10', 'svhn'] else 100
-    args.num_classes = num_classes
+    student, teacher = my_utils.build_student_teacher(args)
+    generator = network.gan.GeneratorA(nz=args.nz, nc=3, img_size=32, activation=args.G_activation)
+    [v.to(args.device) for v in [student,teacher,generator]]
 
-    if args.model == 'resnet34_8x':
-        teacher = network.resnet_8x.ResNet34_8x(num_classes=num_classes)
-        if args.dataset == 'svhn':
-            args.logger.info("Loading SVHN TEACHER")
-            args.ckpt = 'checkpoint/teacher/svhn-resnet34_8x.pt'
-        teacher.load_state_dict( torch.load( args.ckpt, map_location=args.device) )
-    else:
-        teacher = my_utils.get_classifier(args.model, pretrained=True, num_classes=args.num_classes)
-    
-    
+    student_loss = my_utils.SetCriterion(args)
+    generator_loss = my_utils.SetCriterion(args)
 
     teacher.eval()
-    teacher = teacher.to(args.device)
     args.logger.info(f'Teacher restored from: {args.ckpt}') 
     args.logger.info(f'Training with {args.model} as a Target') 
-    correct = 0
-    with torch.no_grad():
-        for i, (data, target) in tqdm(enumerate(test_loader),disable=args.disable_tqdm):
-            data, target = data.to(args.device), target.to(args.device)
-            output = teacher(data)
-            pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    accuracy = 100. * correct / len(test_loader.dataset)
-    args.logger.info(f'Teacher - Test set: Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.4f}%)')
-        
-    student = my_utils.get_classifier(args.student_model, pretrained=False, num_classes=args.num_classes)
-    generator = network.gan.GeneratorA(nz=args.nz, nc=3, img_size=32, activation=args.G_activation)
-
-    student = student.to(args.device)
-    generator = generator.to(args.device)
+    teacher_tqdm_desc = 'Teacher Test: [loss T={:.04f}][acc {:.02f}]'
+    teacher_acc,teacher_log = test(TestOpts(student=teacher,generator=None,student_loss=student_loss,
+                  device=args.device,
+                  use_tqdm=tqdm(desc=teacher_tqdm_desc,disable=args.disable_tqdm,total=math.ceil(len(test_loader.dataset)/args.batch_size)),
+                  use_tqdm_desc=teacher_tqdm_desc,
+                  loader=test_loader))
+    args.logger.info(f'Teacher - Test set: Accuracy: {teacher_acc*100:.2f}% (/{len(test_loader.dataset)})')
 
     if args.student_load_path :
         # "checkpoint/student_no-grad/cifar10-resnet34_8x.pt"
         student.load_state_dict( torch.load( args.student_load_path ) )
-        args.logger.info(f'Student initialized from {args.student_load_path}')
-        acc = test(args, student=student, generator=generator, device = args.device, test_loader = test_loader)
+        student_tqdm_desc = 'Student Test: [loss S={:.04f}][acc {:.02f}]'
+        acc,student_start_log = test(TestOpts(student=student,generator=generator,
+                student_loss=student_loss,
+                device=args.device,
+                use_tqdm=tqdm(desc=teacher_tqdm_desc,disable=args.disable_tqdm,total=math.ceil(len(test_loader.dataset)/args.batch_size)),
+                use_tqdm_desc=teacher_tqdm_desc,
+                loader=test_loader))
+        args.logger.info(f'Student initialized from {args.student_load_path} ({acc*100:.2f}%)')
 
     ## Compute the number of epochs with the given query budget:
     args.cost_per_iteration = args.batch_size * (args.g_iter * (args.grad_m+1) + args.d_iter)
-
     number_epochs = args.query_budget // (args.cost_per_iteration * args.epoch_itrs) + 1
 
     args.logger.info(f'Total budget: {args.query_budget//1000}k')
@@ -357,7 +309,6 @@ def main():
     args.logger.info(f'Total number of epochs: {number_epochs}')
 
     optimizer_S = optim.SGD( student.parameters(), lr=args.lr_S, weight_decay=args.weight_decay, momentum=0.9 )
-
     if args.MAZE:
         optimizer_G = optim.SGD( generator.parameters(), lr=args.lr_G , weight_decay=args.weight_decay, momentum=0.9 )    
     else:
@@ -383,6 +334,7 @@ def main():
     test_tqdm_desc = 'Test: [loss S={:.04f}][acc {:.02f}]'
     trainOpts = TrainOpts(
         student=student,teacher=teacher,generator=generator,
+        student_loss=student_loss,generator_loss=generator_loss,
         student_optimizer=optimizer_S,generator_optimizer=optimizer_G,
         device=args.device,args=args,
         use_tqdm=tqdm(total=args.epoch_itrs, desc=train_tqdm_desc.format(0,0), 
@@ -390,6 +342,7 @@ def main():
         use_tqdm_desc=train_tqdm_desc)
     testOpts = TestOpts(
         student=student,generator=generator,
+        student_loss=student_loss,
         device=args.device,
         loader=test_loader,
         use_tqdm=tqdm(total=math.ceil(len(test_loader.dataset)/args.batch_size), 

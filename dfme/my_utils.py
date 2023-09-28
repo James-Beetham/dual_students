@@ -1,4 +1,4 @@
-import logging,os,argparse,string,shutil,json,sys,typing
+import logging,os,argparse,string,shutil,json,sys,typing,dataclasses
 
 from cifar10_models import *
 from approximate_gradients import *
@@ -153,55 +153,70 @@ def is_jsonable(x):
         return False
 
 
-def get_classifier(classifier, pretrained=True, num_classes=10):
-    if classifier == "wrn-28-10":
-        net =  wrn(
-                    num_classes=num_classes,
-                    depth=28,
-                    widen_factor=10,
-                    dropRate=0.3
-                )
-        if pretrained:
-            state_dict = torch.load("cifar100_models/state_dicts/model_best.pt", map_location=device)["state_dict"]
-            # create new OrderedDict that does not contain `module.`
-            from collections import OrderedDict
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                name = k[7:] # remove `module.`
-                new_state_dict[name] = v
-            net.load_state_dict(new_state_dict)
+class SetCriterion(torch.nn.Module):
+    def __init__(self,args):
+        super().__init__()
+        if args.loss == 'l1':
+            self.lossfn = torch.nn.L1Loss()
+        elif args.loss == 'kl':
+            self.lossfn = torch.nn.KLDivLoss()
 
-        return net
-    elif 'wrn' in classifier and 'kt' not in classifier:
-        depth = int(classifier.split("-")[1])
-        width = int(classifier.split("-")[2])
+    def forward(self,a,b):
+        return self.lossfn(a,b)
 
-        net =  wrn(
-                    num_classes=num_classes,
-                    depth=depth,
-                    widen_factor=width
-                )
-        if pretrained:
-            raise ValueError("Cannot be pretrained")
-        return net
-    elif classifier == "kt-wrn-40-2":
-        net = WideResNetKT(depth=40, num_classes=num_classes, widen_factor=2, dropRate=0.0)
-        if pretrained:
-            state_dict = torch.load("cifar10_models/state_dicts/kt_wrn.pt", map_location=device)["state_dict"]
-            net.load_state_dict(state_dict)
-        return net
-    elif classifier == "resnet34_8x":
-        if pretrained:
-            raise ValueError("Cannot load pretrained resnet34_8x from here")
-        return network.resnet_8x.ResNet34_8x(num_classes=num_classes)
-    elif classifier == "resnet18_8x":
-        if pretrained:
-            raise ValueError("Cannot load pretrained resnet18_8x from here")
-        return network.resnet_8x.ResNet18_8x(num_classes=num_classes)
 
+def _correction_min(o:torch.Tensor)->torch.Tensor:
+    return o - o.min(dim=1).values.view(-1,1)
+def _correction_mean(o:torch.Tensor):
+    return o - o.mean(dim=1).view(-1,1)
+LOGIT_CORRECTIONS:dict[str,typing.Callable[[torch.Tensor],torch.Tensor]] = dict(
+    min=_correction_min,
+    mean=_correction_mean,
+)
+class TargetModel(torch.nn.Module):
+    """Process the target model outputs and remove the gradient.
+    """
+    def __init__(self,args, model:torch.nn.Module):
+        super().__init__()
+        self.model = model
+        self.softmax = None
+        self.correction = None
+        if args.no_logits: 
+            self.softmax = torch.nn.LogSoftmax(dim=1)
+        if args.logit_correction in LOGIT_CORRECTIONS:
+            self.correction = LOGIT_CORRECTIONS[args.logit_correction]
+
+    def forward(self,x:torch.Tensor):
+        o:torch.Tensor = self.model(x)
+        if self.softmax != None: o = self.softmax(o)
+        if self.correction != None: o = self.correction(o)
+        return o.detach()
+
+def build_student_teacher(args):
+    num_classes = 10 if args.dataset in ['cifar10', 'svhn'] else 100
+    args.num_classes = num_classes
+
+    backbone = None
+    backbone_args = [[],dict(num_classes=num_classes)]
+    def add_kwargs(*a,_b=backbone_args,**kwargs): 
+        if len(a) > 0: _b[0] = a
+        if len(kwargs) > 0: _b[1] = {**_b[1],**a}
+    if args.model == 'resnet34_8x':
+        backbone = network.resnet_8x.ResNet34_8x
+    elif args.model == 'resnet18_8x':
+        backbone = network.resnet_8x.ResNet18_8x
     else:
-        raise NameError('Please enter a valid classifier')
+        raise ValueError(f'Unknown model: {args.model}')
 
+    student = backbone(*backbone_args[0],**backbone_args[1])
+    teacher = backbone(*backbone_args[0],**backbone_args[1])    
+    if args.dataset == 'svhn': 
+        args.ckpt = os.path.join(os.path.dirname(args.ckpt),f'{args.dataset}-{args.model}.pt')
+    teacher_weights = torch.load(args.ckpt, map_location=args.device)
+    teacher.load_state_dict(teacher_weights)
+    teacher = TargetModel(args,teacher)
+
+    return student, teacher
 
 def measure_true_grad_norm(opts:train.TrainOpts, x:torch.Tensor):
     # Compute true gradient of loss wrt x
