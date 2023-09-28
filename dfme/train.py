@@ -368,7 +368,13 @@ def main():
         acc,test_logs = test(testOpts)
         epoch_tqdm.set_description(epoch_desc.format(acc*100,best_acc*100))
         with open(os.path.join(args.log_dir,'logs.json.txt'),'a') as f:
-            f.write(json.dumps({**dict(epoch=epoch),**train_logs,**test_logs})+'\n')
+            f.write(json.dumps({**dict(
+                                    epoch=epoch,
+                                    time_remaining=(time.time()-start_time)/epoch*number_epochs,
+                                    time_taken=(time.time()-start_time),
+                                    time=time.time()),
+                                **train_logs,
+                                **test_logs})+'\n')
         acc_list.append(acc)
         if acc>best_acc:
             best_acc = acc
