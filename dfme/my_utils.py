@@ -208,8 +208,9 @@ def build_student_teacher(args):
     else:
         raise ValueError(f'Unknown model: {args.model}')
 
-    student = backbone(*backbone_args[0],**backbone_args[1])
-    teacher = backbone(*backbone_args[0],**backbone_args[1])    
+    student = [backbone(*backbone_args[0],**backbone_args[1]) for i in range(args.num_students)]
+    student = network.multi_student.MultiStudentModel(args,student)
+    teacher = backbone(*backbone_args[0],**backbone_args[1])
     if args.dataset == 'svhn': 
         args.ckpt = os.path.join(os.path.dirname(args.ckpt),f'{args.dataset}-{args.model}.pt')
     teacher_weights = torch.load(args.ckpt, map_location=args.device)
@@ -217,6 +218,11 @@ def build_student_teacher(args):
     teacher = TargetModel(args,teacher)
 
     return student, teacher
+
+def build_criterion(args):
+    student_loss = SetCriterion(args)
+    generator_loss = SetCriterion(args)
+    return student_loss,generator_loss
 
 def measure_true_grad_norm(opts:train.TrainOpts, x:torch.Tensor):
     # Compute true gradient of loss wrt x

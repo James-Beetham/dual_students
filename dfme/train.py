@@ -1,4 +1,4 @@
-import argparse,json,os,random,datetime,logging,math,dataclasses
+import argparse,json,os,random,datetime,logging,math,dataclasses,time
 
 from tqdm import tqdm
 import numpy as np
@@ -36,40 +36,51 @@ def train(opts:TrainOpts):
     args = opts.args
     global file
     opts.teacher.eval()
-    opts.student.train()
     
     opts.use_tqdm.reset()
     for i in range(args.epoch_itrs):
         """Repeat epoch_itrs times per epoch"""
+        opts.generator.train()
+        opts.student.eval()
         for _ in range(args.g_iter):
             #Sample Random Noise
             z = torch.randn((args.batch_size, args.nz)).to(opts.device)
             opts.generator_optimizer.zero_grad()
-            opts.generator.train()
             #Get fake image from generator
             fake:torch.Tensor = opts.generator(z, pre_x=args.approx_grad) # pre_x returns the output of G before applying the activation
 
-
-            ## APPOX GRADIENT
-            approx_grad_wrt_x, loss_G = approximate_gradients.estimate_gradient_objective(args, opts.teacher, opts.student, fake, 
-                                                epsilon = args.grad_epsilon, m = args.grad_m, num_classes=args.num_classes, 
-                                                device=opts.device, pre_x=True)
-
-            fake.backward(approx_grad_wrt_x)
+            if args.num_students == 1:
+                ## APPOX GRADIENT
+                approx_grad_wrt_x, loss_G = approximate_gradients.estimate_gradient_objective(args, opts.teacher, opts.student, fake, 
+                                                    epsilon = args.grad_epsilon, m = args.grad_m, num_classes=args.num_classes, 
+                                                    device=opts.device, pre_x=True)
+                fake.backward(approx_grad_wrt_x)
+            else:
+                s_logit:list[torch.Tensor] = opts.student(fake,combine=False)
+                # all combinations of i,j (students)
+                combs = [(i,j) for i in range(len(s_logit)) for j in range(i+1,len(s_logit))]
+                # maximize distance between logits for students (aka students disagree)
+                loss_G = opts.generator_loss(s_logit[0],s_logit[1])
+                for i,j in combs[1:]: loss_G += opts.generator_loss(s_logit[i],s_logit[j])
+                loss_G = -loss_G / len(combs)
+                loss_G.backward()
             opts.generator_optimizer.step()
 
             if i == 0 and args.rec_grad_norm:
                 x_true_grad = my_utils.measure_true_grad_norm(opts, fake)
 
+        opts.generator.eval()
+        opts.student.train()
         for _ in range(args.d_iter):
             z = torch.randn((args.batch_size, args.nz)).to(opts.device)
             fake = opts.generator(z).detach()
             opts.student_optimizer.zero_grad()
 
-            with torch.no_grad(): t_logit = opts.teacher(fake)
-            s_logit = opts.student(fake)
+            with torch.no_grad(): t_logit:torch.Tensor = opts.teacher(fake)
+            s_logit:list[torch.Tensor] = opts.student(fake,combine=False)
 
-            loss_S = opts.student_loss(s_logit,t_logit.detach())
+            loss_S = torch.stack([opts.student_loss(v,t_logit.detach()) for v in s_logit]).sum() 
+            loss_S:torch.Tensor = loss_S / args.num_students
             loss_S.backward()
             opts.student_optimizer.step()
 
@@ -205,20 +216,23 @@ def main():
     parser.add_argument('--MAZE', type=int, default=0) 
 
     parser.add_argument('--store_checkpoints', type=int, default=1)
-
     parser.add_argument('--student_model', type=str, default='resnet18_8x',
                         help='Student model architecture (default: resnet18_8x)')
-
+    parser.add_argument('--num_students', type=int, default=1,
+                        help='Number of students to use.')
+    parser.add_argument('--combine_student_outputs', type=str, default='first', 
+                        choices=list(network.multi_student.COMBINE_MODES.keys()),
+                        help='How to get single model output for multiple models (for testing).')
 
     args = parser.parse_args()
     my_utils.setup_args(args)
 
+    start_time = time.time()
     args.logger.info(f'torch version: {torch.__version__}')
 
     args.query_budget *=  10**6
     args.query_budget = int(args.query_budget)
     if args.MAZE:
-
         args.logger.info("\n"*2)
         args.logger.info("#### /!\ OVERWRITING ALL PARAMETERS FOR MAZE REPLCIATION ####")
         args.logger.info("\n"*2)
@@ -232,15 +246,12 @@ def main():
         args.lr_S = 1e-1
 
 
-    if args.student_model not in my_utils.classifiers:
-        if "wrn" not in args.student_model:
-            raise ValueError("Unknown model")
-
     args.logger.info(args.log_dir)
     if args.store_checkpoints:
         os.makedirs(args.log_dir + "/checkpoint", exist_ok=True)
 
-    with open('latest_experiments.txt', 'a') as f: f.write(f'{datetime.datetime.now().strftime("%Y/%m/%d, %H:%M:%S")}\t{args.log_dir}\n')
+    with open('latest_experiments.txt', 'a') as f: 
+        f.write(f'{datetime.datetime.now().strftime("%Y/%m/%d, %H:%M:%S")}\t{args.log_dir}\n')
 
     use_cuda = not args.cuda < 0 and torch.cuda.is_available()
     args.device = torch.device(f'cuda:{args.cuda}' if use_cuda else 'cpu')
@@ -274,8 +285,7 @@ def main():
     generator = network.gan.GeneratorA(nz=args.nz, nc=3, img_size=32, activation=args.G_activation)
     [v.to(args.device) for v in [student,teacher,generator]]
 
-    student_loss = my_utils.SetCriterion(args)
-    generator_loss = my_utils.SetCriterion(args)
+    student_loss,generator_loss = my_utils.build_criterion(args)
 
     teacher.eval()
     args.logger.info(f'Teacher restored from: {args.ckpt}') 
@@ -288,7 +298,7 @@ def main():
                   loader=test_loader))
     args.logger.info(f'Teacher - Test set: Accuracy: {teacher_acc*100:.2f}% (/{len(test_loader.dataset)})')
 
-    if args.student_load_path :
+    if args.student_load_path:
         # "checkpoint/student_no-grad/cifar10-resnet34_8x.pt"
         student.load_state_dict( torch.load( args.student_load_path ) )
         student_tqdm_desc = 'Student Test: [loss S={:.04f}][acc {:.02f}]'
@@ -370,7 +380,8 @@ def main():
             torch.save(generator.state_dict(), args.log_dir + f"/checkpoint/generator.pt")
     args.logger.info("Best Acc=%.6f"%best_acc)
 
-    with open(args.log_dir + "/Max_accuracy = %f"%best_acc, "w") as f: f.write(" ")
+    with open(args.log_dir + "/Max_accuracy = %f"%best_acc*100, "w") as f: f.write(" ")
+    args.logger.info(f'Finished ({best_acc*100:02f}%) in {my_utils.pretty_time(time.time()-start_time)}')
 
     # import csv
     # os.makedirs('log', exist_ok=True)
