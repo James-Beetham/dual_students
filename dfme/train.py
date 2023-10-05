@@ -66,8 +66,9 @@ def train(opts:TrainOpts):
                 loss_G.backward()
             opts.generator_optimizer.step()
 
-            if i == 0 and args.rec_grad_norm:
-                x_true_grad = my_utils.measure_true_grad_norm(opts, fake)
+        x_true_grad = None
+        if i == 0 and args.rec_grad_norm:
+            x_true_grad = my_utils.measure_true_grad_norm(opts, fake)
 
         opts.generator.eval()
         opts.student.train()
@@ -87,22 +88,22 @@ def train(opts:TrainOpts):
         # Log Results
         opts.use_tqdm.set_description(opts.use_tqdm_desc.format(loss_G.item(),loss_S.item()))
         opts.use_tqdm.update()
-        if i % args.log_interval == 0:
+        if i % args.log_interval == 0: 
             # args.logger.info(f'Train Epoch: {epoch} [{i}/{args.epoch_itrs} ({100*float(i)/float(args.epoch_itrs):.0f}%)]\tG_Loss: {loss_G.item():.6f} S_loss: {loss_S.item():.6f}')
-            
+            pass
+        if i == 0:
+            with open(args.log_dir + "/loss.json.txt", "a") as f:
+                f.write(json.dumps(dict(epoch=args.epoch,
+                                        generator_loss=loss_G.item(),
+                                        student_loss=loss_S.item()))+'\n')
+        if x_true_grad != None:
+            G_grad_norm, S_grad_norm = compute_grad_norms(opts.generator, opts.student)
             if i == 0:
-                with open(args.log_dir + "/loss.json.txt", "a") as f:
+                with open(args.log_dir + "/norm_grad.json.txt", "a") as f:
                     f.write(json.dumps(dict(epoch=args.epoch,
-                                            generator_loss=loss_G.item(),
-                                            student_loss=loss_S.item()))+'\n')
-            if args.rec_grad_norm and i == 0:
-                G_grad_norm, S_grad_norm = compute_grad_norms(opts.generator, opts.student)
-                if i == 0:
-                    with open(args.log_dir + "/norm_grad.json.txt", "a") as f:
-                        f.write(json.dumps(dict(epoch=args.epoch,
-                                                generator_grad=G_grad_norm.item(),
-                                                student_grad=S_grad_norm.item(),
-                                                true_grad=None if x_true_grad == None else x_true_grad.item()))+'\n')
+                                            generator_grad=G_grad_norm.item(),
+                                            student_grad=S_grad_norm.item(),
+                                            true_grad=None if x_true_grad == None else x_true_grad.item()))+'\n')
 
         # update query budget
         args.query_budget -= args.cost_per_iteration
@@ -386,7 +387,7 @@ def main():
             torch.save(generator.state_dict(), args.log_dir + f"/checkpoint/generator.pt")
     args.logger.info("Best Acc=%.6f"%best_acc)
 
-    with open(args.log_dir + "/Max_accuracy = %f"%best_acc*100, "w") as f: f.write(" ")
+    with open(args.log_dir + f'/Max_accuracy = {best_acc*100:0.4f}', 'w') as f: f.write(' ')
     args.logger.info(f'Finished ({best_acc*100:02f}%) in {my_utils.pretty_time(time.time()-start_time)}')
 
     # import csv
