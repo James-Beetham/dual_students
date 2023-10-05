@@ -192,25 +192,32 @@ class TargetModel(torch.nn.Module):
         if self.correction != None: o = self.correction(o)
         return o.detach()
 
-def build_student_teacher(args):
-    num_classes = 10 if args.dataset in ['cifar10', 'svhn'] else 100
-    args.num_classes = num_classes
-
+def get_backbone_and_args(model_str,num_classes=10,build=True)->\
+        typing.Union[torch.nn.Module,
+                     tuple[typing.Callable[[],torch.nn.Module],tuple[list,dict]]]:
     backbone = None
     backbone_args = [[],dict(num_classes=num_classes)]
     def add_kwargs(*a,_b=backbone_args,**kwargs): 
         if len(a) > 0: _b[0] = a
         if len(kwargs) > 0: _b[1] = {**_b[1],**a}
-    if args.model == 'resnet34_8x':
+    if model_str == 'resnet34_8x':
         backbone = network.resnet_8x.ResNet34_8x
-    elif args.model == 'resnet18_8x':
+    elif model_str == 'resnet18_8x':
         backbone = network.resnet_8x.ResNet18_8x
     else:
-        raise ValueError(f'Unknown model: {args.model}')
+        raise ValueError(f'Unknown model: {model_str}')
+    if build:
+        return backbone(*backbone_args[0],**backbone_args[1])
+    return model, backbone_args
 
-    student = [backbone(*backbone_args[0],**backbone_args[1]) for i in range(args.num_students)]
+def build_student_teacher(args):
+    num_classes = 10 if args.dataset in ['cifar10', 'svhn'] else 100
+    args.num_classes = num_classes
+
+    student = [get_backbone_and_args(args.student_model, num_classes=num_classes)
+               for i in range(args.num_students)]
     student = network.multi_student.MultiStudentModel(args,student)
-    teacher = backbone(*backbone_args[0],**backbone_args[1])
+    teacher = get_backbone_and_args(args.model, num_classes=num_classes)
     if args.dataset == 'svhn': 
         args.ckpt = os.path.join(os.path.dirname(args.ckpt),f'{args.dataset}-{args.model}.pt')
     teacher_weights = torch.load(args.ckpt, map_location=args.device)
@@ -223,6 +230,44 @@ def build_criterion(args):
     student_loss = SetCriterion(args)
     generator_loss = SetCriterion(args)
     return student_loss,generator_loss
+
+def build_optimizers_and_schedulers(args, student:torch.nn.Module, 
+                                    generator: torch.nn.Module)->\
+        tuple[list[torch.optim.Optimizer],
+              torch.optim.Optimizer,
+              torch.optim.lr_scheduler.LRScheduler]:
+    optimizer_S = []
+    sgd_args = dict(lr=args.lr_S, weight_decay=args.weight_decay, momentum=0.9)
+    if args.num_students == 1:
+        optimizer_S.append(torch.optim.SGD(student.parameters(), **sgd_args))
+    elif isinstance(student, network.multi_student.MultiStudentModel):
+        for s in student.models:
+            optimizer_S.append(torch.optim.SGD(s.parameters(), **sgd_args))
+    else:
+        raise ValueError(f'Multiple students were specified, but student model type was unknown',type(student),student)
+
+    if args.MAZE:
+        optimizer_G = torch.optim.SGD( generator.parameters(), lr=args.lr_G , weight_decay=args.weight_decay, momentum=0.9 )    
+    else:
+        optimizer_G = torch.optim.Adam( generator.parameters(), lr=args.lr_G )
+    
+    steps = sorted([int(step * args.number_epochs) for step in args.steps])
+    args.logger.info(f'Learning rate scheduling at steps: {steps}')
+
+    if args.scheduler == "multistep":
+        sched_class = torch.optim.lr_scheduler.MultiStepLR
+        sched_args = [steps, args.scale]
+    elif args.scheduler == "cosine":
+        sched_class = torch.optim.lr_scheduler.CosineAnnealingLR
+        sched_args = [steps, args.number_epochs]
+    schedulers = []
+    for s in optimizer_S:
+        schedulers.append(sched_class(s,*sched_args))
+    schedulers.append(sched_class(optimizer_G,*sched_args))
+
+    return optimizer_S, optimizer_G, schedulers
+
+
 
 def measure_true_grad_norm(opts:train.TrainOpts, x:torch.Tensor):
     # Compute true gradient of loss wrt x

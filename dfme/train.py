@@ -28,20 +28,26 @@ class TrainTestOpts():
 class TrainOpts(TrainTestOpts):
     teacher: torch.nn.Module
     generator_loss: torch.nn.Module
-    student_optimizer: optim.Optimizer
+    student_optimizer: list[optim.Optimizer]
     generator_optimizer: optim.Optimizer
     args: argparse.Namespace
 def train(opts:TrainOpts):
     """Main Loop for one epoch of Training Generator and Student"""
+    train_logs = dict()
+    train_time = time.time()
+    train_generator_duration = 0
+    train_student_duration = 0
+    tqdm_desc = 'Train: [loss G={:0.4f}|S{:0.4f}]'
+    opts.use_tqdm.set_description(opts.use_tqdm_desc.format(tqdm_desc.format(0,0)))
     args = opts.args
     global file
     opts.teacher.eval()
-    
     opts.use_tqdm.reset()
     for i in range(args.epoch_itrs):
         """Repeat epoch_itrs times per epoch"""
         opts.generator.train()
         opts.student.eval()
+        generator_time = time.time()
         for _ in range(args.g_iter):
             #Sample Random Noise
             z = torch.randn((args.batch_size, args.nz)).to(opts.device)
@@ -69,24 +75,36 @@ def train(opts:TrainOpts):
         x_true_grad = None
         if i == 0 and args.rec_grad_norm:
             x_true_grad = my_utils.measure_true_grad_norm(opts, fake)
+        train_generator_duration += time.time() - generator_time
 
         opts.generator.eval()
         opts.student.train()
+        student_time = time.time()
         for _ in range(args.d_iter):
             z = torch.randn((args.batch_size, args.nz)).to(opts.device)
             fake = opts.generator(z).detach()
-            opts.student_optimizer.zero_grad()
+            for v in opts.student_optimizer: v.zero_grad()
 
             with torch.no_grad(): t_logit:torch.Tensor = opts.teacher(fake)
-            s_logit:list[torch.Tensor] = opts.student(fake,combine=False)
 
-            loss_S = torch.stack([opts.student_loss(v,t_logit.detach()) for v in s_logit]).sum() 
-            loss_S:torch.Tensor = loss_S / args.num_students
-            loss_S.backward()
-            opts.student_optimizer.step()
+            if args.num_students == 1:
+                s_logit:list[torch.Tensor] = opts.student(fake,combine=False)
+
+                loss_S = torch.stack([opts.student_loss(v,t_logit.detach()) for v in s_logit]).sum() 
+                loss_S:torch.Tensor = loss_S / args.num_students
+                loss_S.backward()
+                for v in opts.student_optimizer: v.step() # there should only be 1
+            elif isinstance(opts.student,network.multi_student.MultiStudentModel):
+                for m,o in zip(opts.student.models,opts.student_optimizer):
+                    s_logit:list[torch.Tensor] = m(fake)
+                    loss_S = opts.student_loss(s_logit,t_logit.detach()).sum() 
+                    loss_S.backward()
+                    o.step()
+            else: raise ValueError(f'Unknown student model type',type(opts.student))
+        train_student_duration += time.time() - student_time
 
         # Log Results
-        opts.use_tqdm.set_description(opts.use_tqdm_desc.format(loss_G.item(),loss_S.item()))
+        opts.use_tqdm.set_description(opts.use_tqdm_desc.format(tqdm_desc.format(loss_G.item(),loss_S.item())))
         opts.use_tqdm.update()
         if i % args.log_interval == 0: 
             # args.logger.info(f'Train Epoch: {epoch} [{i}/{args.epoch_itrs} ({100*float(i)/float(args.epoch_itrs):.0f}%)]\tG_Loss: {loss_G.item():.6f} S_loss: {loss_S.item():.6f}')
@@ -109,7 +127,14 @@ def train(opts:TrainOpts):
         args.query_budget -= args.cost_per_iteration
         if args.query_budget < args.cost_per_iteration:
             break
-    return dict() 
+    train_time = time.time() - train_time
+    train_logs['time_p'] = my_utils.pretty_time(train_time)
+    train_logs['time_p_generator'] = my_utils.pretty_time(train_generator_duration)
+    train_logs['time_p_student'] = my_utils.pretty_time(train_student_duration)
+    train_logs['time_sec'] = train_time
+    train_logs['time_sec_generator'] = train_generator_duration
+    train_logs['time_sec_student'] = train_student_duration
+    return train_logs
 
 @dataclasses.dataclass(frozen=True,order=True)
 class TestOpts(TrainTestOpts):
@@ -118,6 +143,8 @@ def test(opts:TestOpts):
     global file
     opts.student.eval()
 
+    tqdm_desc = 'Test: [loss S={:0.4f}][acc {:0.2f}]'
+    opts.use_tqdm.set_description(opts.use_tqdm_desc.format(tqdm_desc.format(0,0)))
     loss_sum = 0
     correct = 0
     total = 0
@@ -132,7 +159,8 @@ def test(opts:TestOpts):
             pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
             total += data.size(0)
-            opts.use_tqdm.set_description(opts.use_tqdm_desc.format(loss_sum/total,correct/total*100))
+            opts.use_tqdm.set_description(opts.use_tqdm_desc.format(
+                tqdm_desc.format(loss_sum/total,correct/total*100)))
             opts.use_tqdm.update()
 
     loss_sum /= len(opts.loader.dataset)
@@ -180,6 +208,7 @@ def main():
     parser.add_argument('--dataset', type=str, default='cifar10', choices=['svhn','cifar10'], help='dataset name (default: cifar10)')
     parser.add_argument('--data_dir', type=str, default='data')
     parser.add_argument('--model', type=str, default='resnet34_8x', choices=my_utils.classifiers, help='Target model name (default: resnet34_8x)')
+    parser.add_argument('--skip_test_model', default=False, action='store_true', help='Skips evaluating teacher first.')
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
@@ -188,7 +217,6 @@ def main():
                         help='random seed (default: 1)')
     parser.add_argument('--ckpt', type=str, default='checkpoint/teacher/cifar10-resnet34_8x.pt')
     
-
     parser.add_argument('--student_load_path', type=str, default=None)
     parser.add_argument('--model_id', type=str, default="debug")
 
@@ -290,14 +318,14 @@ def main():
 
     teacher.eval()
     args.logger.info(f'Teacher restored from: {args.ckpt}') 
-    args.logger.info(f'Training with {args.model} as a Target') 
-    teacher_tqdm_desc = 'Teacher Test: [loss T={:.04f}][acc {:.02f}]'
-    teacher_acc,teacher_log = test(TestOpts(student=teacher,generator=None,student_loss=student_loss,
-                  device=args.device,
-                  use_tqdm=tqdm(desc=teacher_tqdm_desc,disable=args.disable_tqdm,total=math.ceil(len(test_loader.dataset)/args.batch_size)),
-                  use_tqdm_desc=teacher_tqdm_desc,
-                  loader=test_loader))
-    args.logger.info(f'Teacher - Test set: Accuracy: {teacher_acc*100:.2f}% (/{len(test_loader.dataset)})')
+    if not args.skip_test_model:
+        args.logger.info(f'Training with {args.model} as a Target') 
+        teacher_acc,teacher_log = test(TestOpts(student=teacher,generator=None,student_loss=student_loss,
+                    device=args.device,
+                    use_tqdm=tqdm(disable=args.disable_tqdm,total=math.ceil(len(test_loader.dataset)/args.batch_size)),
+                    use_tqdm_desc='Teacher {}',
+                    loader=test_loader))
+        args.logger.info(f'Teacher - Test set: Accuracy: {teacher_acc*100:.2f}% (/{len(test_loader.dataset)})')
 
     if args.student_load_path:
         # "checkpoint/student_no-grad/cifar10-resnet34_8x.pt"
@@ -306,60 +334,41 @@ def main():
         acc,student_start_log = test(TestOpts(student=student,generator=generator,
                 student_loss=student_loss,
                 device=args.device,
-                use_tqdm=tqdm(desc=teacher_tqdm_desc,disable=args.disable_tqdm,total=math.ceil(len(test_loader.dataset)/args.batch_size)),
-                use_tqdm_desc=teacher_tqdm_desc,
+                use_tqdm=tqdm(disable=args.disable_tqdm,total=math.ceil(len(test_loader.dataset)/args.batch_size)),
+                use_tqdm_desc='Student ',
                 loader=test_loader))
         args.logger.info(f'Student initialized from {args.student_load_path} ({acc*100:.2f}%)')
 
     ## Compute the number of epochs with the given query budget:
     args.cost_per_iteration = args.batch_size * (args.g_iter * (args.grad_m+1) + args.d_iter)
-    number_epochs = args.query_budget // (args.cost_per_iteration * args.epoch_itrs) + 1
+    number_epochs = args.number_epochs = args.query_budget // (args.cost_per_iteration * args.epoch_itrs) + 1
 
     args.logger.info(f'Total budget: {args.query_budget//1000}k')
     args.logger.info(f'Cost per iterations: {args.cost_per_iteration}')
     args.logger.info(f'Total number of epochs: {number_epochs}')
 
-    optimizer_S = optim.SGD( student.parameters(), lr=args.lr_S, weight_decay=args.weight_decay, momentum=0.9 )
-    if args.MAZE:
-        optimizer_G = optim.SGD( generator.parameters(), lr=args.lr_G , weight_decay=args.weight_decay, momentum=0.9 )    
-    else:
-        optimizer_G = optim.Adam( generator.parameters(), lr=args.lr_G )
-    
-    steps = sorted([int(step * number_epochs) for step in args.steps])
-    args.logger.info(f'Learning rate scheduling at steps: {steps}')
-
-    if args.scheduler == "multistep":
-        scheduler_S = optim.lr_scheduler.MultiStepLR(optimizer_S, steps, args.scale)
-        scheduler_G = optim.lr_scheduler.MultiStepLR(optimizer_G, steps, args.scale)
-    elif args.scheduler == "cosine":
-        scheduler_S = optim.lr_scheduler.CosineAnnealingLR(optimizer_S, number_epochs)
-        scheduler_G = optim.lr_scheduler.CosineAnnealingLR(optimizer_G, number_epochs)
-    schedulers = [scheduler_S,scheduler_G]
+    optimizer_S, optimizer_G, schedulers = my_utils.build_optimizers_and_schedulers(args,student,generator)
 
     best_acc = 0
     acc_list = []
 
     epoch_desc = 'Epochs: [test_acc {:.02f}% ({:.02f}% best)]'
     epoch_tqdm = tqdm(range(1,number_epochs + 1), desc=epoch_desc.format(0,0), disable=args.disable_tqdm, position=0)
-    train_tqdm_desc = 'Train: [loss G={:.04f}|S={:.04f}]'
-    test_tqdm_desc = 'Test: [loss S={:.04f}][acc {:.02f}]'
     trainOpts = TrainOpts(
         student=student,teacher=teacher,generator=generator,
         student_loss=student_loss,generator_loss=generator_loss,
         student_optimizer=optimizer_S,generator_optimizer=optimizer_G,
         device=args.device,args=args,
-        use_tqdm=tqdm(total=args.epoch_itrs, desc=train_tqdm_desc.format(0,0), 
-                      disable=args.disable_tqdm, position=1),
-        use_tqdm_desc=train_tqdm_desc)
+        use_tqdm=tqdm(total=args.epoch_itrs, disable=args.disable_tqdm, position=1),
+        use_tqdm_desc='{}')
     testOpts = TestOpts(
         student=student,generator=generator,
         student_loss=student_loss,
         device=args.device,
         loader=test_loader,
         use_tqdm=tqdm(total=math.ceil(len(test_loader.dataset)/args.batch_size), 
-                      desc=test_tqdm_desc.format(0,0), 
                       disable=args.disable_tqdm, position=2),
-        use_tqdm_desc=test_tqdm_desc)
+        use_tqdm_desc='{}')
     for epoch in epoch_tqdm:
         # Train
         args.epoch = epoch
@@ -371,8 +380,8 @@ def main():
         with open(os.path.join(args.log_dir,'logs.json.txt'),'a') as f:
             f.write(json.dumps({**dict(
                                     epoch=epoch,
-                                    time_remaining=(time.time()-start_time)/epoch*number_epochs,
-                                    time_taken=(time.time()-start_time),
+                                    time_remaining=my_utils.pretty_time((time.time()-start_time)/epoch*number_epochs),
+                                    time_taken=my_utils.pretty_time(time.time()-start_time),
                                     time=time.time()),
                                 **train_logs,
                                 **test_logs})+'\n')
