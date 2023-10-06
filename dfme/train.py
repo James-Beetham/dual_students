@@ -159,7 +159,10 @@ def test(opts:TestOpts):
         for i, (data, target) in enumerate(opts.loader):
             data: torch.Tensor; target: torch.Tensor
             data, target = data.to(opts.device), target.to(opts.device)
-            output:torch.Tensor = opts.student(data, test=True)
+            if isinstance(opts.student,network.multi_student.MultiStudentModel):
+                output:torch.Tensor = opts.student(data, test=True)
+            else:
+                output:torch.Tensor = opts.student(data)
 
             loss_sum += F.cross_entropy(output, target, reduction='sum').item() # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
