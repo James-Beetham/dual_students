@@ -3,12 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MovingAverages(nn.Module):
-    def __init__(self, model_class, args=[], kwargs={}, momentum=0):
+    def __init__(self, model_class, args_kwargs=([],{}), momentum=0):
         super(MovingAverages, self).__init__()
-        print(model_class, args, kwargs)
-        self.model_train = model_class(*args, **kwargs)
+        self.model_train:nn.Module = model_class(*args_kwargs[0], **args_kwargs[1])
         if momentum > 0:
-            self.model_test = model_class(*args, **kwargs)
+            self.model_test:nn.Module = model_class(*args_kwargs[0], **args_kwargs[1])
             self.model_test.eval()
         self.momentum = momentum
         self.first = True

@@ -123,6 +123,12 @@ def train(opts:TrainOpts):
                                             student_grad=S_grad_norm.item(),
                                             true_grad=None if x_true_grad == None else x_true_grad.item()))+'\n')
 
+        # step
+        if i % 10 == 9 and args.student_momentum > 0:
+            [v(None, step=True) for v in opts.student.models]
+        if i % 10 == 9 and args.generator_momentum > 0:
+            opts.generator(None, step=True)
+
         # update query budget
         args.query_budget -= args.cost_per_iteration
         if args.query_budget < args.cost_per_iteration:
@@ -153,7 +159,7 @@ def test(opts:TestOpts):
         for i, (data, target) in enumerate(opts.loader):
             data: torch.Tensor; target: torch.Tensor
             data, target = data.to(opts.device), target.to(opts.device)
-            output:torch.Tensor = opts.student(data)
+            output:torch.Tensor = opts.student(data, test=True)
 
             loss_sum += F.cross_entropy(output, target, reduction='sum').item() # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
@@ -174,13 +180,13 @@ def test(opts:TestOpts):
 def compute_grad_norms(generator, student):
     G_grad = []
     for n, p in generator.named_parameters():
-        if "weight" in n:
+        if 'weight' in n and not isinstance(p.grad, type(None)):
             # print('===========\ngradient{}\n----------\n{}'.format(n, p.grad.norm().to("cpu")))
             G_grad.append(p.grad.norm().to("cpu"))
 
     S_grad = []
     for n, p in student.named_parameters():
-        if "weight" in n:
+        if 'weight' in n and not isinstance(p.grad, type(None)):
             # print('===========\ngradient{}\n----------\n{}'.format(n, p.grad.norm().to("cpu")))
             S_grad.append(p.grad.norm().to("cpu"))
     return  np.mean(G_grad), np.mean(S_grad)
@@ -252,6 +258,10 @@ def main():
     parser.add_argument('--combine_student_outputs', type=str, default='first', 
                         choices=list(network.multi_student.COMBINE_MODES.keys()),
                         help='How to get single model output for multiple models (for testing).')
+    parser.add_argument('--student_momentum', type=float, default=0.9, 
+                        help='Use moving averages method for models, or 0 to disable (default 0)')
+    parser.add_argument('--generator_momentum', type=float, default=0.9, 
+                        help='Use moving averages method for models, or 0 to disable (default 0)')
 
     args = parser.parse_args()
     my_utils.setup_args(args)
@@ -311,7 +321,10 @@ def main():
     args.G_activation = torch.tanh
 
     student, teacher = my_utils.build_student_teacher(args)
-    generator = network.gan.GeneratorA(nz=args.nz, nc=3, img_size=32, activation=args.G_activation)
+    # generator = network.gan.GeneratorA(nz=args.nz, nc=3, img_size=32, activation=args.G_activation)
+    generator = network.moving_averages.MovingAverages(network.gan.GeneratorA,
+            ([],dict(nz=args.nz, nc=3, img_size=32, activation=args.G_activation)),
+            args.generator_momentum)
     [v.to(args.device) for v in [student,teacher,generator]]
 
     student_loss,generator_loss = my_utils.build_criterion(args)

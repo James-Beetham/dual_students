@@ -192,7 +192,8 @@ class TargetModel(torch.nn.Module):
         if self.correction != None: o = self.correction(o)
         return o.detach()
 
-def get_backbone_and_args(model_str,num_classes=10,build=True)->\
+def get_backbone_and_args(model_str,num_classes=10,build=True,use_momentum=True,
+                          momentum=0)->\
         typing.Union[torch.nn.Module,
                      tuple[typing.Callable[[],torch.nn.Module],tuple[list,dict]]]:
     backbone = None
@@ -206,18 +207,25 @@ def get_backbone_and_args(model_str,num_classes=10,build=True)->\
         backbone = network.resnet_8x.ResNet18_8x
     else:
         raise ValueError(f'Unknown model: {model_str}')
+    
+    if use_momentum:
+        # add momentum moving averages
+        backbone_args = [[backbone],dict(args_kwargs=backbone_args, momentum=momentum)]
+        backbone = network.moving_averages.MovingAverages
+
     if build:
         return backbone(*backbone_args[0],**backbone_args[1])
-    return model, backbone_args
+    return backbone, backbone_args
 
 def build_student_teacher(args):
     num_classes = 10 if args.dataset in ['cifar10', 'svhn'] else 100
     args.num_classes = num_classes
 
-    student = [get_backbone_and_args(args.student_model, num_classes=num_classes)
+    student = [get_backbone_and_args(args.student_model, num_classes=num_classes,
+                                     momentum=args.student_momentum)
                for i in range(args.num_students)]
     student = network.multi_student.MultiStudentModel(args,student)
-    teacher = get_backbone_and_args(args.model, num_classes=num_classes)
+    teacher = get_backbone_and_args(args.model, num_classes=num_classes,use_momentum=False)
     if args.dataset == 'svhn': 
         args.ckpt = os.path.join(os.path.dirname(args.ckpt),f'{args.dataset}-{args.model}.pt')
     teacher_weights = torch.load(args.ckpt, map_location=args.device)

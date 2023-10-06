@@ -25,10 +25,10 @@ class MultiStudentModel(torch.nn.Module):
         self.models = torch.nn.ModuleList(models)
         self.pre_combine,self.combine = COMBINE_MODES[args.combine_student_outputs]
 
-    def forward(self,x:torch.Tensor,combine=True):
+    def forward(self,x:torch.Tensor,*args,combine=True,**kwargs):
         models = self.models
         if combine: models = self.pre_combine(self.models)
         o = []
-        for m in models: o.append(m(x))
+        for m in models: o.append(m(x,*args,**kwargs))
         if combine: o = self.combine(o)
         return o
