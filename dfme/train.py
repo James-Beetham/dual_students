@@ -253,7 +253,8 @@ def main():
 
     parser.add_argument('--MAZE', type=int, default=0) 
 
-    parser.add_argument('--store_checkpoints', type=int, default=1)
+    parser.add_argument('--no_checkpoints', default=False, action='store_true', 
+                        help='Does not save checkpoints.')
     parser.add_argument('--student_model', type=str, default='resnet18_8x',
                         help='Student model architecture (default: resnet18_8x)')
     parser.add_argument('--num_students', type=int, default=1,
@@ -262,9 +263,9 @@ def main():
                         choices=list(network.multi_student.COMBINE_MODES.keys()),
                         help='How to get single model output for multiple models (for testing).')
     parser.add_argument('--student_momentum', type=float, default=0.9, 
-                        help='Use moving averages method for models, or 0 to disable (default 0)')
+                        help='Use moving averages method for models, or 0 to disable (default 0.9)')
     parser.add_argument('--generator_momentum', type=float, default=0.9, 
-                        help='Use moving averages method for models, or 0 to disable (default 0)')
+                        help='Use moving averages method for models, or 0 to disable (default 0.9)')
 
     args = parser.parse_args()
     my_utils.setup_args(args)
@@ -289,7 +290,7 @@ def main():
 
 
     args.logger.info(args.log_dir)
-    if args.store_checkpoints:
+    if not args.no_checkpoints:
         os.makedirs(args.log_dir + "/checkpoint", exist_ok=True)
 
     with open('latest_experiments.txt', 'a') as f: 
@@ -405,9 +406,10 @@ def main():
         if acc>best_acc:
             best_acc = acc
             name = 'resnet34_8x'
-            torch.save(student.state_dict(),f"checkpoint/student_{args.model_id}/{args.dataset}-{name}.pt")
-            torch.save(generator.state_dict(),f"checkpoint/student_{args.model_id}/{args.dataset}-{name}-generator.pt")
-        if args.store_checkpoints:
+            if not args.no_checkpoints:
+                torch.save(student.state_dict(),f"checkpoint/student_{args.model_id}/{args.dataset}-{name}.pt")
+                torch.save(generator.state_dict(),f"checkpoint/student_{args.model_id}/{args.dataset}-{name}-generator.pt")
+        if not args.no_checkpoints:
             torch.save(student.state_dict(), args.log_dir + f"/checkpoint/student.pt")
             torch.save(generator.state_dict(), args.log_dir + f"/checkpoint/generator.pt")
     args.logger.info("Best Acc=%.6f"%best_acc)
