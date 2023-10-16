@@ -199,7 +199,8 @@ def main():
     parser = argparse.ArgumentParser(description='DFAD CIFAR')
     parser.add_argument('--batch_size', type=int, default=256, metavar='N',help='input batch size for training (default: 256)')
     parser.add_argument('--query_budget', type=float, default=20, metavar='N', help='Query budget for the extraction attack in millions (default: 20M)')
-    parser.add_argument('--epoch_itrs', type=int, default=50)
+    parser.add_argument('--epoch_itrs', type=int, default=50, 
+                        help='Number of student-generator iterations per epoch, or -1 to match queries/epoch of dfme.')
     parser.add_argument('--g_iter', type=int, default=1, help = "Number of generator iterations per epoch_iter")
     parser.add_argument('--d_iter', type=int, default=5, help = "Number of discriminator iterations per epoch_iter")
 
@@ -357,11 +358,23 @@ def main():
         args.logger.info(f'Student initialized from {args.student_load_path} ({acc*100:.2f}%)')
 
     ## Compute the number of epochs with the given query budget:
-    args.cost_per_iteration = args.batch_size * (args.g_iter * (args.grad_m+1) + args.d_iter)
+    if args.num_students == 1:
+        args.cost_per_iteration = args.batch_size * (args.g_iter * (args.grad_m+1) + args.d_iter)
+    else:
+        args.cost_per_iteration = args.batch_size * args.d_iter
+    if args.epoch_itrs != -1:
+        number_epochs = args.query_budget // (args.cost_per_iteration * args.epoch_itrs) + 1
+    else: # compute epoch_iters which result in same number of epochs
+        # original number of iterations in amount in dfme cifar10
+        number_epochs = 224 if args.dataset in ['cifar10', 'cifar100'] else 23 
+        args.epoch_itrs = args.query_budget // ((number_epochs - 1) * args.cost_per_iteration)
+
+
     number_epochs = args.number_epochs = args.query_budget // (args.cost_per_iteration * args.epoch_itrs) + 1
 
     args.logger.info(f'Total budget: {args.query_budget//1000}k')
     args.logger.info(f'Cost per iterations: {args.cost_per_iteration}')
+    args.logger.info(f'Iterations per epoch: {args.epoch_itrs}')
     args.logger.info(f'Total number of epochs: {number_epochs}')
 
     optimizer_S, optimizer_G, schedulers = my_utils.build_optimizers_and_schedulers(args,student,generator)
