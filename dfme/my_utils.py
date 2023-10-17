@@ -154,15 +154,26 @@ def is_jsonable(x):
 
 
 class SetCriterion(torch.nn.Module):
-    def __init__(self,args):
+    LOSSES = ['l1','kl','ce']
+    def __init__(self,args, generator=False):
         super().__init__()
-        if args.loss == 'l1':
+        sloss = args.generator_loss if generator else args.loss
+
+        self.pre_loss = None
+        self.post_loss = None
+        if sloss == 'l1':
             self.lossfn = torch.nn.L1Loss()
-        elif args.loss == 'kl':
+        elif sloss == 'kl':
             self.lossfn = torch.nn.KLDivLoss()
+        elif sloss == 'ce':
+            self.pre_loss = lambda a,b: (a,torch.argmax(b,dim=1))
+            self.lossfn = torch.nn.CrossEntropyLoss()
 
     def forward(self,a,b):
-        return self.lossfn(a,b)
+        if self.pre_loss != None: a,b = self.pre_loss(a,b)
+        o = self.lossfn(a,b)
+        if self.post_loss != None: o = self.post_loss(o)
+        return o
 
 
 def _correction_min(o:torch.Tensor)->torch.Tensor:
@@ -180,9 +191,12 @@ class TargetModel(torch.nn.Module):
         super().__init__()
         self.model = model
         self.softmax = None
+        self.max = None
         self.correction = None
-        if args.no_logits: 
+        if args.no_logits == 1:
             self.softmax = torch.nn.LogSoftmax(dim=1)
+        elif args.no_logits == -1:
+            self.max = lambda x: torch.nn.functional.one_hot(torch.argmax(x,dim=1),args.num_classes).to(torch.float32)
         if args.logit_correction in LOGIT_CORRECTIONS:
             self.correction = LOGIT_CORRECTIONS[args.logit_correction]
 
@@ -190,6 +204,7 @@ class TargetModel(torch.nn.Module):
         o:torch.Tensor = self.model(x)
         if self.softmax != None: o = self.softmax(o)
         if self.correction != None: o = self.correction(o)
+        if self.max != None: o = self.max(o)
         return o.detach()
 
 def get_backbone_and_args(model_str,num_classes=10,build=True,use_momentum=True,
@@ -236,7 +251,7 @@ def build_student_teacher(args):
 
 def build_criterion(args):
     student_loss = SetCriterion(args)
-    generator_loss = SetCriterion(args)
+    generator_loss = SetCriterion(args,generator=True)
     return student_loss,generator_loss
 
 def build_optimizers_and_schedulers(args, student:torch.nn.Module, 

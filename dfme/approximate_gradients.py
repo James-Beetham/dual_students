@@ -132,12 +132,14 @@ def compute_gradient(args, victim_model, clone_model, x:torch.Tensor, pre_x=Fals
                 pred_victim = pred_victim_no_logits - pred_victim_no_logits.mean(dim=1).view(-1, 1)
             else:
                 pred_victim = pred_victim_no_logits
-
     elif args.loss == "kl":
         loss_fn = F.kl_div
         pred_clone = F.log_softmax(pred_clone, dim=1)
         pred_victim = F.softmax(pred_victim, dim=1)
-
+    elif args.loss == 'ce':
+        loss_fn = F.cross_entropy
+        pred_clone = pred_clone
+        pred_victim = torch.argmax(pred_victim, dim=1)
     else:
         raise ValueError(args.loss)
 

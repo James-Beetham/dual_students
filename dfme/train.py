@@ -210,7 +210,8 @@ def main():
 
     parser.add_argument('--log_interval', type=int, default=10, metavar='N', help='how many batches to wait before logging training status')
     
-    parser.add_argument('--loss', type=str, default='l1', choices=['l1', 'kl'],)
+    parser.add_argument('--loss', type=str, default='l1', choices=my_utils.SetCriterion.LOSSES)
+    parser.add_argument('--generator_loss', type=str, default='l1', choices=my_utils.SetCriterion.LOSSES)
     parser.add_argument('--scheduler', type=str, default='multistep', choices=['multistep', 'cosine', "none"],)
     parser.add_argument('--steps', nargs='+', default = [0.1, 0.3, 0.5], type=float, help = "Percentage epochs at which to take next step")
     parser.add_argument('--scale', type=float, default=3e-1, help = "Fractional decrease in lr")
@@ -247,7 +248,7 @@ def main():
     
 
     # Eigenvalues computation parameters
-    parser.add_argument('--no_logits', type=int, default=1)
+    parser.add_argument('--no_logits', type=int, default=1, help='0: logits, 1: log_probs, -1: hard_labels')
     parser.add_argument('--logit_correction', type=str, default='mean', choices=['none', 'mean'])
 
     parser.add_argument('--rec_grad_norm', type=int, default=1)
@@ -368,9 +369,7 @@ def main():
         # original number of iterations in amount in dfme cifar10
         number_epochs = 224 if args.dataset in ['cifar10', 'cifar100'] else 23 
         args.epoch_itrs = args.query_budget // ((number_epochs - 1) * args.cost_per_iteration)
-
-
-    number_epochs = args.number_epochs = args.query_budget // (args.cost_per_iteration * args.epoch_itrs) + 1
+    args.number_epochs = number_epochs
 
     args.logger.info(f'Total budget: {args.query_budget//1000}k')
     args.logger.info(f'Cost per iterations: {args.cost_per_iteration}')
