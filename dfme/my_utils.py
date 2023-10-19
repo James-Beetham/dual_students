@@ -255,11 +255,13 @@ def build_criterion(args):
     return student_loss,generator_loss
 
 def build_optimizers_and_schedulers(args, student:torch.nn.Module, 
-                                    generator: torch.nn.Module)->\
+                                    generator: torch.nn.Module,
+                                    optimizer_s_statedict: list[dict]|None,
+                                    optimizer_g_statedict: dict|None)->\
         tuple[list[torch.optim.Optimizer],
               torch.optim.Optimizer,
               torch.optim.lr_scheduler.LRScheduler]:
-    optimizer_S = []
+    optimizer_S:list[torch.optim.Optimizer] = []
     sgd_args = dict(lr=args.lr_S, weight_decay=args.weight_decay, momentum=0.9)
     if args.num_students == 1:
         optimizer_S.append(torch.optim.SGD(student.parameters(), **sgd_args))
@@ -268,15 +270,23 @@ def build_optimizers_and_schedulers(args, student:torch.nn.Module,
             optimizer_S.append(torch.optim.SGD(s.parameters(), **sgd_args))
     else:
         raise ValueError(f'Multiple students were specified, but student model type was unknown',type(student),student)
+    if optimizer_s_statedict != None:
+        [a.load_state_dict(v) for a,v in zip(optimizer_S,optimizer_s_statedict)]
+        args.logger.info(f'Loaded student optimizer(s): {len(optimizer_s_statedict)}')
 
     if args.MAZE:
         optimizer_G = torch.optim.SGD( generator.parameters(), lr=args.lr_G , weight_decay=args.weight_decay, momentum=0.9 )    
     else:
         optimizer_G = torch.optim.Adam( generator.parameters(), lr=args.lr_G )
+    if optimizer_g_statedict != None:
+        optimizer_G.load_state_dict(optimizer_g_statedict)
+        args.logger.info(f'Loaded generator optimizer')
     
     steps = sorted([int(step * args.number_epochs) for step in args.steps])
     args.logger.info(f'Learning rate scheduling at steps: {steps}')
 
+    sched_args = []
+    sched_kwargs = dict(last_epoch=args.start_epoch if args.start_epoch>0 else -1)
     if args.scheduler == "multistep":
         sched_class = torch.optim.lr_scheduler.MultiStepLR
         sched_args = [steps, args.scale]
@@ -285,8 +295,8 @@ def build_optimizers_and_schedulers(args, student:torch.nn.Module,
         sched_args = [steps, args.number_epochs]
     schedulers = []
     for s in optimizer_S:
-        schedulers.append(sched_class(s,*sched_args))
-    schedulers.append(sched_class(optimizer_G,*sched_args))
+        schedulers.append(sched_class(s,*sched_args,**sched_kwargs))
+    schedulers.append(sched_class(optimizer_G,*sched_args,**sched_kwargs))
 
     return optimizer_S, optimizer_G, schedulers
 

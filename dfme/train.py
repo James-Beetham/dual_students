@@ -229,7 +229,9 @@ def main():
     parser.add_argument('--ckpt', type=str, default='checkpoint/teacher/cifar10-resnet34_8x.pt')
     
     parser.add_argument('--student_load_path', type=str, default=None)
-    parser.add_argument('--model_id', type=str, default="debug")
+    parser.add_argument('--resume', default=False, action='store_true', 
+                        help='Will resume at checkpoint/epoch_checkpoint.pt in log_dir')
+    parser.add_argument('--model_id', type=str, default='debug')
 
     parser.add_argument('--log_dir', type=str, default='results')
     parser.add_argument('--log_level', type=str, choices=logging._nameToLevel, default='INFO')
@@ -346,18 +348,6 @@ def main():
                     loader=test_loader))
         args.logger.info(f'Teacher - Test set: Accuracy: {teacher_acc*100:.2f}% (/{len(test_loader.dataset)})')
 
-    if args.student_load_path:
-        # "checkpoint/student_no-grad/cifar10-resnet34_8x.pt"
-        student.load_state_dict( torch.load( args.student_load_path ) )
-        student_tqdm_desc = 'Student Test: [loss S={:.04f}][acc {:.02f}]'
-        acc,student_start_log = test(TestOpts(student=student,generator=generator,
-                student_loss=student_loss,
-                device=args.device,
-                use_tqdm=tqdm(disable=args.disable_tqdm,total=math.ceil(len(test_loader.dataset)/args.batch_size)),
-                use_tqdm_desc='Student ',
-                loader=test_loader))
-        args.logger.info(f'Student initialized from {args.student_load_path} ({acc*100:.2f}%)')
-
     ## Compute the number of epochs with the given query budget:
     if args.num_students == 1:
         args.cost_per_iteration = args.batch_size * (args.g_iter * (args.grad_m+1) + args.d_iter)
@@ -376,13 +366,31 @@ def main():
     args.logger.info(f'Iterations per epoch: {args.epoch_itrs}')
     args.logger.info(f'Total number of epochs: {number_epochs}')
 
-    optimizer_S, optimizer_G, schedulers = my_utils.build_optimizers_and_schedulers(args,student,generator)
-
     best_acc = 0
-    acc_list = []
+    args.start_epoch = 0
+    optimizer_S_statedict,optimizer_G_statedict = None,None
+    epoch_checkpoint_path = os.path.join(args.log_dir,'checkpoint/epoch_checkpoint.pt')
+    if args.resume and args.student_load_path == None: args.student_load_path = epoch_checkpoint_path
+    if args.student_load_path and os.path.isfile(args.student_load_path):
+        ckpt = EpochCheckpoint(**torch.load(args.student_load_path))
+        student.load_state_dict(ckpt.student)
+        generator.load_state_dict(ckpt.generator)
+        optimizer_S_statedict,optimizer_G_statedict = ckpt.opt_students,ckpt.opt_generator
+        best_acc = ckpt.best_acc
+        args.start_epoch = ckpt.epoch
+        args.logger.info(f'Student initialized from epoch {args.start_epoch}, path: {args.student_load_path}')
+        acc,student_start_log = test(TestOpts(student=student,generator=generator,
+                student_loss=student_loss,
+                device=args.device,
+                use_tqdm=tqdm(disable=args.disable_tqdm,total=math.ceil(len(test_loader.dataset)/args.batch_size)),
+                use_tqdm_desc='Loaded Student {}',
+                loader=test_loader))
+        args.logger.info(f'\tLoaded student accuracy: {acc*100:0.4f}%')
+
+    optimizer_S, optimizer_G, schedulers = my_utils.build_optimizers_and_schedulers(args,student,generator,optimizer_S_statedict,optimizer_G_statedict)
 
     epoch_desc = 'Epochs: [test_acc {:.02f}% ({:.02f}% best)]'
-    epoch_tqdm = tqdm(range(1,number_epochs + 1), desc=epoch_desc.format(0,0), disable=args.disable_tqdm, position=0)
+    epoch_tqdm = tqdm(range(args.start_epoch+1,number_epochs + 1), desc=epoch_desc.format(0,0), disable=args.disable_tqdm, position=0)
     trainOpts = TrainOpts(
         student=student,teacher=teacher,generator=generator,
         student_loss=student_loss,generator_loss=generator_loss,
@@ -402,10 +410,9 @@ def main():
         # Train
         args.epoch = epoch
         train_logs = train(trainOpts)
-        if args.scheduler != "none": [v.step() for v in schedulers]
+        if args.scheduler != 'none': [v.step() for v in schedulers]
         # Test
         acc,test_logs = test(testOpts)
-        epoch_tqdm.set_description(epoch_desc.format(acc*100,best_acc*100))
         with open(os.path.join(args.log_dir,'logs.json.txt'),'a') as f:
             f.write(json.dumps({**dict(
                                     epoch=epoch,
@@ -414,26 +421,36 @@ def main():
                                     time=time.time()),
                                 **train_logs,
                                 **test_logs})+'\n')
-        acc_list.append(acc)
+
         if acc>best_acc:
             best_acc = acc
-            name = 'resnet34_8x'
             if not args.no_checkpoints:
-                torch.save(student.state_dict(),f"checkpoint/student_{args.model_id}/{args.dataset}-{name}.pt")
-                torch.save(generator.state_dict(),f"checkpoint/student_{args.model_id}/{args.dataset}-{name}-generator.pt")
+                torch.save(student.state_dict(),os.path.join(args.log_dir,f'checkpoint/student.pt'))
+                torch.save(generator.state_dict(),os.path.join(args.log_dir, f'checkpoint/generator.pt'))
         if not args.no_checkpoints:
-            torch.save(student.state_dict(), args.log_dir + f"/checkpoint/student.pt")
-            torch.save(generator.state_dict(), args.log_dir + f"/checkpoint/generator.pt")
-    args.logger.info("Best Acc=%.6f"%best_acc)
+            epoch_checkpoint = EpochCheckpoint(
+                student.state_dict(),
+                [v.state_dict() for v in optimizer_S],
+                generator.state_dict(),
+                optimizer_G.state_dict(),
+                epoch,
+                best_acc,
+            )
+            torch.save(dataclasses.asdict(epoch_checkpoint), epoch_checkpoint_path)
+        epoch_tqdm.set_description(epoch_desc.format(acc*100,best_acc*100))
 
+    args.logger.info("Best Acc=%.6f"%best_acc)
     with open(args.log_dir + f'/Max_accuracy = {best_acc*100:0.4f}', 'w') as f: f.write(' ')
     args.logger.info(f'Finished ({best_acc*100:02f}%) in {my_utils.pretty_time(time.time()-start_time)}')
 
-    # import csv
-    # os.makedirs('log', exist_ok=True)
-    # with open('log/DFAD-%s.csv'%(args.dataset), 'a') as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(acc_list)
+@dataclasses.dataclass(frozen=True,order=True)
+class EpochCheckpoint():
+    student: dict
+    opt_students: list[dict]
+    generator: dict
+    opt_generator: dict
+    epoch: int
+    best_acc: float
 
 
 if __name__ == '__main__':
