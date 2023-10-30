@@ -1,9 +1,9 @@
 .DS_Store
 *.pyc
-dfme/save_results/*
-dfme/checkpoint/*
-dfme/data/*
-dfme/log/
-dfme/latest_experiments.txt
+dual_students/save_results/*
+dual_students/checkpoint/*
+dual_students/data/*
+dual_students/log/
+dual_students/latest_experiments.txt
 
 .vscode/

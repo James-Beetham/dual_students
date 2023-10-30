@@ -1,4 +1,4 @@
-cd dfme;
+cd dual_students;
 
 python3 train.py \
     --dataset cifar10 \

@@ -14,11 +14,11 @@ pip install -r requirements.txt
 ## Replicating  Results
 
 ### Load Victim Model Weights
-First, download the pretrained victim model weights from [this dropbox](https://www.dropbox.com/sh/lt6w0nq3msp4do0/AADmJk2k3LQqFqWt9916W-nra?dl=0). The two file names are `cifar10-resnet34_8x.pt` and `svhn-resnet34_8x.pt`. The CIFAR10 weights were found on the [Data Free Adversarial Distillation](https://github.com/VainF/Data-Free-Adversarial-Distillation) dropbox, while we trained the SVHN model ourselves.
+First, download the pretrained victim model weights from [this dropbox](https://www.dropbox.com/sh/lt6w0nq3msp4do0/AADmJk2k3LQqFqWt9916W-nra?dl=0). The two file names are `cifar10-resnet34_8x.pt` and `svhn-resnet34_8x.pt`. The CIFAR10 weights were found on the [Data Free Adversarial Distillation](https://github.com/VainF/Data-Free-Adversarial-Distillation) dropbox.
 
 Then, store the pre-trained model weights at the following location
 
-`dfme/checkpoint/teacher/{victim_dataset}-resnet34_8x.pt`
+`dual_students/checkpoint/teacher/{victim_dataset}-resnet34_8x.pt`
 
 
 ### Perform Model Extraction
